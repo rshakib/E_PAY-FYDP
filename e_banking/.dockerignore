@@ -11,10 +11,6 @@ __pycache__
 backend/__pycache__
 *.pyc
 
-backend/.env.backend
-frontend/.env
-.env
-.env.*
 
 *.log
 *.out
