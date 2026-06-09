@@ -1,0 +1,54 @@
+services:
+  app:
+    build:
+      context: ./e_banking
+      dockerfile: Dockerfile
+      args:
+        VITE_BACKEND_URL: ${VITE_BACKEND_URL:-http://localhost:5001}
+    image: e-pay-sandbox:latest
+    container_name: e-pay-sandbox-app
+    env_file:
+      - ./e_banking/backend/.env.backend
+    environment:
+      PORT: 5001
+      FLASK_ENV: production
+    ports:
+      - "${APP_PORT:-5001}:5001"
+    networks:
+      - e-pay-sandbox
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:5001/health', timeout=5)\""
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
+
+  zap:
+    image: ghcr.io/zaproxy/zaproxy:stable
+    container_name: e-pay-sandbox-zap
+    profiles:
+      - security-tools
+    command:
+      [
+        "zap-baseline.py",
+        "-t",
+        "http://app:5001",
+        "-r",
+        "zap-baseline-report.html"
+      ]
+    volumes:
+      - ./zap-reports:/zap/wrk:rw
+    depends_on:
+      app:
+        condition: service_healthy
+    networks:
+      - e-pay-sandbox
+
+networks:
+  e-pay-sandbox:
+    name: e-pay-sandbox
