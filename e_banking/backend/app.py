@@ -4,6 +4,9 @@ from flask_cors import CORS
 from crypto import CryptoEngine
 import datetime
 import re
+import threading
+import time
+import requests as http_requests
 from supabase import create_client, Client
 from supabase_config import SUPABASE_URL as CONFIG_URL, SUPABASE_KEY as CONFIG_KEY
 import os
@@ -295,6 +298,47 @@ def same_username(left, right):
 def health():
     """Health check endpoint"""
     return jsonify({"status": "ok", "message": "E-Banking API is running"}), 200
+
+
+# ========================================
+# Self-Ping: Keep Render + Supabase Always Awake
+# ========================================
+def _self_ping_loop():
+    """Background thread that pings /health every 14 minutes to prevent
+    Render free-tier from sleeping and Supabase free-tier from pausing."""
+    HEALTH_CHECK_INTERVAL = 14 * 60  # 14 minutes in seconds
+    # Wait 60s after boot so the server is fully ready
+    time.sleep(60)
+    while True:
+        try:
+            port = int(os.environ.get('PORT', '5001'))
+            resp = http_requests.get(f"http://127.0.0.1:{port}/health", timeout=10)
+            if resp.status_code == 200:
+                print("[SELF-PING] Server is awake", flush=True)
+            else:
+                print(f"[SELF-PING] Unexpected status: {resp.status_code}", flush=True)
+        except Exception as e:
+            print(f"[SELF-PING] Ping failed: {e}", flush=True)
+
+        # Also touch Supabase to keep it from pausing (7-day inactivity timeout)
+        try:
+            supabase.table('profiles').select('id').limit(1).execute()
+            print("[SELF-PING] Supabase is active", flush=True)
+        except Exception as e:
+            # Schema errors are fine — the query still reaches Supabase
+            print(f"[SELF-PING] Supabase touch completed (may have non-critical error): {e}", flush=True)
+
+        time.sleep(HEALTH_CHECK_INTERVAL)
+
+
+def start_self_ping():
+    """Start the self-ping background thread (daemon so it dies with the process)."""
+    t = threading.Thread(target=_self_ping_loop, daemon=True, name="self-ping")
+    t.start()
+    print("[SELF-PING] Background keep-alive thread started (every 14 minutes)", flush=True)
+
+
+start_self_ping()
 
 @app.route('/')
 def serve_index():
