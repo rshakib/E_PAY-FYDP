@@ -575,9 +575,9 @@ def health():
 # Self-Ping: Keep Render + Supabase Always Awake
 # ========================================
 def _self_ping_loop():
-    """Background thread that pings /health every 14 minutes to prevent
+    """Background thread that pings /health every 10 minutes to prevent
     Render free-tier from sleeping and Supabase free-tier from pausing."""
-    HEALTH_CHECK_INTERVAL = 14 * 60
+    HEALTH_CHECK_INTERVAL = 10 * 60  # 10 minutes
     time.sleep(60)
     while True:
         try:
@@ -610,7 +610,7 @@ def _self_ping_loop():
 def start_self_ping():
     t = threading.Thread(target=_self_ping_loop, daemon=True, name="self-ping")
     t.start()
-    print("[SELF-PING] Background keep-alive thread started (every 14 minutes)", flush=True)
+    print("[SELF-PING] Background keep-alive thread started (every 10 minutes)", flush=True)
 
 
 start_self_ping()
