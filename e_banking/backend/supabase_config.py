@@ -20,7 +20,7 @@ IDENTITY_SUPABASE_KEY = os.environ.get('IDENTITY_SUPABASE_SERVICE_ROLE_KEY') or 
 # ============================================
 # DB2: Business/Transaction Database
 # ============================================
-SUPABASE_URL = os.environ.get('SUPABASE_URL', 'https://oeicttbhtmevpyupekjn.supabase.co')
+SUPABASE_URL = os.environ.get('SUPABASE_URL', '')
 SUPABASE_KEY = os.environ.get('SUPABASE_SERVICE_ROLE_KEY') or os.environ.get('SUPABASE_KEY', '')
 
 # ============================================
