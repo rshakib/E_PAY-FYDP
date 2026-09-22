@@ -481,7 +481,7 @@ def record_transaction(sender_account_id, receiver_account_id, amount, status, f
             'amount': float(amount),
             'status': status,
             'failure_reason': failure_reason,
-            'reference': f"TXN-{datetime.datetime.now().isoformat()}"
+            'reference': f"TXN-{datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%d%H%M%S%f')}-{uuid.uuid4().hex[:8]}"
         }
         response = business_db.table('transactions').insert(transaction_data).execute()
         return response.data[0] if response.data else None
@@ -575,9 +575,9 @@ def health():
 # Self-Ping: Keep Render + Supabase Always Awake
 # ========================================
 def _self_ping_loop():
-    """Background thread that pings /health every 10 minutes to prevent
+    """Background thread that pings /health every 14 minutes to prevent
     Render free-tier from sleeping and Supabase free-tier from pausing."""
-    HEALTH_CHECK_INTERVAL = 10 * 60  # 10 minutes
+    HEALTH_CHECK_INTERVAL = 14 * 60
     time.sleep(60)
     while True:
         try:
@@ -610,7 +610,7 @@ def _self_ping_loop():
 def start_self_ping():
     t = threading.Thread(target=_self_ping_loop, daemon=True, name="self-ping")
     t.start()
-    print("[SELF-PING] Background keep-alive thread started (every 10 minutes)", flush=True)
+    print("[SELF-PING] Background keep-alive thread started (every 14 minutes)", flush=True)
 
 
 start_self_ping()
@@ -1021,8 +1021,21 @@ def get_transactions(username):
             return jsonify({"status": "error", "message": "Account not found"}), 404
 
         # DB2: transactions
-        sent_response = business_db.table('transactions').select('*').eq('sender_account_id', user_account['id']).order('created_at', desc=True).limit(20).execute()
-        received_response = business_db.table('transactions').select('*').eq('receiver_account_id', user_account['id']).order('created_at', desc=True).limit(20).execute()
+        # Delta sync support: when ?since=<iso_timestamp> is supplied only rows
+        # newer than that timestamp are returned (previously the param was ignored).
+        since = request.args.get('since')
+        try:
+            tx_limit = int(os.environ.get('TRANSACTIONS_PAGE_LIMIT', '500'))
+        except ValueError:
+            tx_limit = 500
+
+        sent_query = business_db.table('transactions').select('*').eq('sender_account_id', user_account['id'])
+        received_query = business_db.table('transactions').select('*').eq('receiver_account_id', user_account['id'])
+        if since:
+            sent_query = sent_query.gt('created_at', since)
+            received_query = received_query.gt('created_at', since)
+        sent_response = sent_query.order('created_at', desc=True).limit(tx_limit).execute()
+        received_response = received_query.order('created_at', desc=True).limit(tx_limit).execute()
 
         transactions = []
 
@@ -1067,7 +1080,13 @@ def get_transactions(username):
                     "type": "received"
                 })
 
-        transactions.sort(key=lambda x: x['created_at'], reverse=True)
+        def _created_ts(value):
+            try:
+                return datetime.datetime.fromisoformat(str(value or '').replace('Z', '+00:00')).timestamp()
+            except Exception:
+                return 0.0
+
+        transactions.sort(key=lambda x: _created_ts(x.get('created_at')), reverse=True)
 
         return jsonify({
             "status": "success",
