@@ -103,6 +103,12 @@ pii_encryption = None
 lookup_hash = None
 server_private_key_pem = None
 server_public_key_pem = None
+server_private_key_pem = None
+
+server_ecdh_private_key_pem = None
+server_ecdh_public_key_pem = None
+server_ecdh_public_hex = None
+server_ecdh_key_id = "hte-bank-ecdh-v1"
 
 if PII_KEY and PII_KEY != 'REPLACE_WITH_64_CHAR_HEX_KEY':
     try:
@@ -117,8 +123,50 @@ if PII_PEPPER and PII_PEPPER != 'REPLACE_WITH_64_CHAR_HEX_KEY':
         print(f"Warning: Lookup hash init failed: {e}", flush=True)
 
 
+def ensure_server_ecdh_keys():
+    """Generate or load server long-term P-256 ECDH key pair."""
+    global server_ecdh_private_key_pem, server_ecdh_public_key_pem, server_ecdh_public_hex, server_ecdh_key_id
+
+    # Try loading from DB2 first
+    try:
+        result = business_db.table('server_keys').select('*').eq('id', server_ecdh_key_id).execute()
+        if result.data and len(result.data) > 0:
+            server_ecdh_private_key_pem = result.data[0]['private_key_pem']
+            server_ecdh_public_key_pem = result.data[0]['public_key_pem']
+            # Derive hex format
+            priv_obj = HybridEnvelopeCrypto.load_server_ecdh_private_key(server_ecdh_private_key_pem)
+            from cryptography.hazmat.primitives import serialization
+            server_ecdh_public_hex = priv_obj.public_key().public_bytes(
+                encoding=serialization.Encoding.X962,
+                format=serialization.PublicFormat.UncompressedPoint
+            ).hex()
+            print(f"[SERVER KEYS] Loaded ECDH P-256 keys (KeyID={server_ecdh_key_id}) from database", flush=True)
+            return
+    except Exception as e:
+        if not is_missing_schema_error(e):
+            print(f"[SERVER KEYS] Could not load ECDH keys from DB: {e}", flush=True)
+
+    # Generate new P-256 ECDH key pair
+    server_ecdh_private_key_pem, server_ecdh_public_key_pem, server_ecdh_public_hex = HybridEnvelopeCrypto.generate_server_ecdh_keypair()
+    print(f"[SERVER KEYS] Generated new P-256 ECDH key pair (KeyID={server_ecdh_key_id})", flush=True)
+
+    # Try to save to DB2
+    try:
+        business_db.table('server_keys').insert({
+            'id': server_ecdh_key_id,
+            'private_key_pem': server_ecdh_private_key_pem,
+            'public_key_pem': server_ecdh_public_key_pem,
+        }).execute()
+        print(f"[SERVER KEYS] Saved ECDH P-256 keys to database (KeyID={server_ecdh_key_id})", flush=True)
+    except Exception as e:
+        if is_missing_schema_error(e):
+            print("[SERVER KEYS] DB tables not ready yet, ECDH keys held in memory only", flush=True)
+        else:
+            print(f"[SERVER KEYS] Could not save ECDH keys to DB: {e}", flush=True)
+
+
 def ensure_server_rsa_keys():
-    """Generate or load server RSA key pair."""
+    """Generate or load server RSA key pair (legacy fallback)."""
     global server_private_key_pem, server_public_key_pem
 
     # Try loading from DB2 first
@@ -621,10 +669,19 @@ start_self_ping()
 
 @app.route('/server-public-key', methods=['GET'])
 def get_server_public_key():
-    """Return the server's RSA public key (PEM format) for envelope encryption."""
-    if not server_public_key_pem:
-        return jsonify({"status": "error", "message": "Server RSA keys not initialized"}), 500
-    return jsonify({"status": "success", "public_key": server_public_key_pem}), 200
+    """Return the server's ECDH P-256 public key (hex and PEM) and KeyID for Hybrid Transaction Envelopes."""
+    if not server_ecdh_public_hex and not server_public_key_pem:
+        return jsonify({"status": "error", "message": "Server cryptographic keys not initialized"}), 500
+
+    return jsonify({
+        "status": "success",
+        "public_key": server_ecdh_public_hex or server_public_key_pem,
+        "ecdh_public_key": server_ecdh_public_hex,
+        "ecdh_public_pem": server_ecdh_public_key_pem,
+        "key_id": server_ecdh_key_id,
+        "KeyID": server_ecdh_key_id,
+        "rsa_public_key": server_public_key_pem,
+    }), 200
 
 
 @app.route('/')
@@ -734,10 +791,124 @@ def process_transfer():
             return jsonify({"status": "error", "message": "User account not found"}), 404
 
         # ============================================
-        # PATH 1: Hybrid Envelope (new RSA + AES-GCM)
+        # PATH 1: Hybrid Transaction Envelope (HTE: ECDH + HKDF + AES-GCM + ECDSA)
         # ============================================
         envelope = data.get('envelope')
-        if envelope and server_private_key_pem:
+        if envelope and (envelope.get('ePK') or envelope.get('epk')) and server_ecdh_private_key_pem:
+            try:
+                # Normalize keys
+                ePK = envelope.get('ePK') or envelope.get('epk')
+                IV = envelope.get('IV') or envelope.get('iv')
+                C = envelope.get('C') or envelope.get('ciphertext')
+                Tag = envelope.get('Tag') or envelope.get('tag')
+                Sig = envelope.get('Sig') or envelope.get('sig') or envelope.get('signature')
+                AAD = envelope.get('AAD') or envelope.get('aad') or {}
+                v = envelope.get('v', 1)
+                key_id = envelope.get('KeyID') or envelope.get('key_id') or server_ecdh_key_id
+                txid = AAD.get('TxID') or envelope.get('txid') or ''
+
+                # Step 1: Validate protocol version and KeyID
+                if int(v) != 1:
+                    return jsonify({"status": "error", "message": f"Unsupported HTE protocol version: {v}"}), 400
+                if key_id != server_ecdh_key_id:
+                    return jsonify({"status": "error", "message": f"Unknown or retired KeyID: {key_id}"}), 400
+
+                # Step 2: Verify ECDSA signature using registered device public key
+                user_pub_key = user_profile.get('rsa_public_key') or user_profile.get('ecdsa_public_key')
+                if not user_pub_key:
+                    return jsonify({"status": "error", "message": "User has not enrolled device signing keys"}), 400
+
+                # Canonicalize AAD bytes (sorted JSON without whitespace)
+                aad_bytes = json.dumps(AAD, sort_keys=True, separators=(',', ':')).encode('utf-8')
+                canonical_data = (
+                    str(v) + key_id
+                ).encode('utf-8') + bytes.fromhex(ePK) + bytes.fromhex(IV) + bytes.fromhex(C) + bytes.fromhex(Tag) + aad_bytes
+
+                if not HybridEnvelopeCrypto.verify_hte_signature(canonical_data, Sig, user_pub_key):
+                    print(f"[TRANSFER] HTE ECDSA signature verification failed for user {username}", flush=True)
+                    return jsonify({"status": "error", "message": "Biometric device signature verification failed"}), 403
+
+                # Step 3: Verify timestamp freshness & TxID syntax
+                tx_time_str = AAD.get('T')
+                if not tx_time_str or not txid:
+                    return jsonify({"status": "error", "message": "Missing timestamp T or TxID in envelope AAD"}), 400
+
+                # Step 4: Idempotency check with unique TxID
+                cached_result = check_idempotency(txid)
+                if cached_result:
+                    print(f"[TRANSFER] Idempotent duplicate HTE TxID: {txid}", flush=True)
+                    return jsonify(cached_result), 200
+
+                # Step 5: Derive transaction key KT via ECDH(SK_B^dh, ePK) + HKDF-SHA256
+                server_priv_key = HybridEnvelopeCrypto.load_server_ecdh_private_key(server_ecdh_private_key_pem)
+                KT = HybridEnvelopeCrypto.derive_hte_session_key(server_priv_key, ePK, AAD, key_id)
+
+                # Step 6: Verify GCM tag and decrypt payment payload M
+                payload = HybridEnvelopeCrypto.decrypt_hte_payload(C, IV, Tag, aad_bytes, KT)
+
+                # Step 7: Business validation
+                receiver_username = validate_username(payload.get('R'))
+                amount = float(payload.get('A', 0))
+                txid_from_payload = payload.get('TxID', '')
+
+                if txid != txid_from_payload:
+                    return jsonify({"status": "error", "message": "TxID mismatch between envelope and decrypted payload"}), 400
+                if not receiver_username:
+                    return jsonify({"status": "error", "message": "Invalid receiver username"}), 400
+                if amount <= 0:
+                    return jsonify({"status": "error", "message": "Amount must be greater than zero"}), 400
+                if same_username(username, receiver_username):
+                    return jsonify({"status": "error", "message": "Self transaction not allowed"}), 400
+
+                receiver_account = get_receiver_account(receiver_username)
+                if not receiver_account:
+                    txn = record_transaction(user_account['id'], None, amount, 'aborted', 'Receiver not found')
+                    create_notification(user_profile['id'], "Transfer aborted", "Receiver username was not found.", "transfer_aborted", txn.get('id') if txn else None)
+                    return jsonify({"status": "error", "message": "Receiver not found"}), 404
+
+                if user_account['balance'] < amount:
+                    txn = record_transaction(user_account['id'], receiver_account['id'], amount, 'futile', 'Insufficient balance')
+                    create_notification(user_profile['id'], "Transfer futile", "Insufficient balance.", "transfer_futile", txn.get('id') if txn else None)
+                    return jsonify({"status": "futile", "message": "Insufficient balance"}), 400
+
+                # Step 8: Atomically commit financial update
+                sender_new_balance = float(user_account['balance']) - amount
+                receiver_new_balance = float(receiver_account['balance']) + amount
+
+                update_account_balance(user_account['id'], sender_new_balance)
+                update_account_balance(receiver_account['id'], receiver_new_balance)
+
+                new_t = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                update_profile_timestamp(user_profile['id'], new_t)
+                update_daily_spend(user_profile['id'], float(user_profile.get('today_spent', 0)) + amount)
+
+                txn = record_transaction(user_account['id'], receiver_account['id'], amount, 'success')
+                transaction_id = txn.get('id') if txn else None
+                create_notification(user_profile['id'], "Transfer successful", f"BDT {amount:.2f} sent to {receiver_username}.", "transfer_success", transaction_id)
+                create_notification(receiver_account['profile_id'], "Money received", f"BDT {amount:.2f} received from {username}.", "transfer_success", transaction_id)
+
+                result = {
+                    "status": "success",
+                    "message": f"Transfer of {amount} to {receiver_username} successful",
+                    "new_t": new_t,
+                    "new_balance": sender_new_balance,
+                    "txid": txid
+                }
+
+                # Save atomic idempotency key
+                save_idempotency(txid, user_profile['id'], receiver_account['id'], amount, 'committed', result)
+                print(f"[TRANSFER] HTE transaction {txid} settled successfully!", flush=True)
+
+                return jsonify(result), 200
+
+            except Exception as hte_err:
+                print(f"[TRANSFER] HTE processing error: {hte_err}", flush=True)
+                return jsonify({"status": "error", "message": f"HTE envelope error: {str(hte_err)}"}), 400
+
+        # ============================================
+        # PATH 1B: Legacy RSA Envelope
+        # ============================================
+        elif envelope and envelope.get('encrypted_key') and server_private_key_pem:
             try:
                 txid = envelope.get('txid', '')
 
@@ -762,7 +933,6 @@ def process_transfer():
                 if not user_pub_key:
                     return jsonify({"status": "error", "message": "User has not enrolled RSA keys. Use legacy transfer."}), 400
 
-                # Reconstruct the signed message (AAD + encrypted components)
                 sign_message = json.dumps({
                     "ciphertext": envelope['ciphertext'],
                     "nonce": envelope['nonce'],
@@ -773,24 +943,13 @@ def process_transfer():
                 if not HybridEnvelopeCrypto.verify_signature(sign_message, envelope['signature'], user_pub_key):
                     return jsonify({"status": "error", "message": "Signature verification failed"}), 403
 
-                # 5. Verify timestamp freshness (within ±5 minutes)
-                try:
-                    tx_time = datetime.datetime.fromisoformat(payload['T'].replace('Z', '+00:00'))
-                    now = datetime.datetime.now(datetime.timezone.utc)
-                    if abs((now - tx_time).total_seconds()) > 300:
-                        return jsonify({"status": "error", "message": "Transaction timestamp expired"}), 403
-                except Exception:
-                    return jsonify({"status": "error", "message": "Invalid timestamp format"}), 400
-
-                # 6. Extract transfer details
+                # Business validation & settlement
                 receiver_username = validate_username(payload.get('R'))
                 amount = float(payload.get('A', 0))
                 txid_from_payload = payload.get('TxID', '')
 
                 if txid != txid_from_payload:
                     return jsonify({"status": "error", "message": "TxID mismatch between envelope and payload"}), 400
-
-                # 7. Business validation
                 if not receiver_username:
                     return jsonify({"status": "error", "message": "Invalid receiver username"}), 400
                 if amount <= 0:
@@ -809,7 +968,6 @@ def process_transfer():
                     create_notification(user_profile['id'], "Transfer futile", "Insufficient balance.", "transfer_futile", txn.get('id') if txn else None)
                     return jsonify({"status": "futile", "message": "Insufficient balance"}), 400
 
-                # 8. Execute transfer
                 sender_new_balance = float(user_account['balance']) - amount
                 receiver_new_balance = float(receiver_account['balance']) + amount
 
@@ -832,13 +990,11 @@ def process_transfer():
                     "new_balance": sender_new_balance
                 }
 
-                # 9. Save idempotency key
                 save_idempotency(txid, user_profile['id'], receiver_account['id'], amount, 'committed', result)
-
                 return jsonify(result), 200
 
             except Exception as envelope_err:
-                print(f"[TRANSFER] Envelope processing error: {envelope_err}", flush=True)
+                print(f"[TRANSFER] RSA envelope processing error: {envelope_err}", flush=True)
                 return jsonify({"status": "error", "message": f"Envelope processing failed: {str(envelope_err)}"}), 400
 
         # ============================================
@@ -1157,8 +1313,7 @@ def register():
         # New fields from enhanced registration
         full_name = data.get('fullName') or data.get('full_name') or ''
         mobile = data.get('mobile') or data.get('phone') or ''
-        email = data.get('email') or ''
-        rsa_public_key = data.get('rsaPublicKey') or data.get('rsa_public_key') or ''
+        rsa_public_key = data.get('rsaPublicKey') or data.get('rsa_public_key') or data.get('ecdsaPublicKey') or data.get('ecdsa_public_key') or ''
         biometric_enrolled = data.get('biometricEnrolled', False)
 
         # Check if user already exists (DB1)
@@ -1410,6 +1565,7 @@ with app.app_context():
     print("=" * 60, flush=True)
 
     auto_create_tables()
+    ensure_server_ecdh_keys()
     ensure_server_rsa_keys()
 
 if __name__ == '__main__':
