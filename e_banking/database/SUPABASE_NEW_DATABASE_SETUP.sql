@@ -361,6 +361,29 @@ create table if not exists public.security_events (
     created_at timestamptz not null default now()
 );
 
+-- Nonce replay state (paper §3 step 3).
+create table if not exists public.used_nonces (
+    nonce text primary key,
+    txid text,
+    sender text,
+    used_at timestamptz not null default now()
+);
+
+-- ---------- Supabase Vault hook (optional — paper §2 "HSM or equivalent isolated service") ----------
+-- 1) Store the server ECDH private-key PEM in Vault (Dashboard -> Vault, or vault.create_secret()).
+-- 2) Set SERVER_KEY_VAULT_SECRET on the server to that secret's name.
+-- 3) The backend reads it via this SECURITY DEFINER function; otherwise it falls back to server_keys.
+create or replace function public.vault_read_secret(secret_name text)
+returns text
+language sql
+security definer
+set search_path = vault, public
+as $$
+  select decrypted_secret from vault.decrypted_secrets where name = secret_name limit 1;
+$$;
+revoke all on function public.vault_read_secret(text) from public, anon, authenticated;
+grant execute on function public.vault_read_secret(text) to service_role;
+
 notify pgrst, 'reload schema';
 
 
