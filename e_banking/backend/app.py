@@ -1,5 +1,8 @@
 from flask import Flask, request, jsonify, send_from_directory, g
 import uuid
+import hmac
+import hashlib
+import base64
 from flask_cors import CORS
 from crypto import CryptoEngine
 from crypto_v2 import HybridEnvelopeCrypto, PIIEncryption, LookupHash
@@ -503,19 +506,49 @@ def create_notification(profile_id, title, message, notification_type="system", 
             raise
         print(f"Error creating notification: {e}")
 
-def generate_session_token() -> str:
-    token = str(uuid.uuid4())
-    return token
+# Stateless signed sessions: survive restarts and work across gunicorn workers
+# (the previous in-memory `active_sessions` was lost on every redeploy → 401s).
+SESSION_SECRET = os.environ.get('SESSION_SECRET') or os.environ.get('PII_HMAC_PEPPER') or 'dpt-session-secret-v1-change-me'
+SESSION_TTL_SECONDS = int(os.environ.get('SESSION_TTL_SECONDS', str(60 * 60 * 24 * 30)))  # 30 days
+
+
+def generate_session_token(username: str) -> str:
+    """base64url(username).expiry.hmac_sha256 — no server-side store required."""
+    exp = int(time.time()) + SESSION_TTL_SECONDS
+    payload = f"{username}.{exp}"
+    sig = hmac.new(SESSION_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    u = base64.urlsafe_b64encode(username.encode()).rstrip(b'=').decode()
+    return f"{u}.{exp}.{sig}"
+
+
+def verify_session_token(token: str):
+    try:
+        u_b64, exp_s, sig = token.split('.')
+        pad = '=' * (-len(u_b64) % 4)
+        username = base64.urlsafe_b64decode(u_b64 + pad).decode()
+        payload = f"{username}.{exp_s}"
+        expected = hmac.new(SESSION_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, expected):
+            return None
+        if int(exp_s) < int(time.time()):
+            return None
+        return username
+    except Exception:
+        return None
+
 
 def require_auth(f):
-    """Decorator to require a valid session token."""
+    """Require a valid session token (in-memory OR stateless signed)."""
     @wraps(f)
     def decorated(*args, **kwargs):
         auth_header = request.headers.get('Authorization', '')
         token = auth_header[7:].strip() if auth_header.startswith('Bearer ') else ''
-        if not token or token not in active_sessions:
+        username = None
+        if token:
+            username = active_sessions.get(token) or verify_session_token(token)
+        if not username:
             return jsonify({"status": "error", "message": "Unauthorized"}), 401
-        g.authenticated_username = active_sessions[token]
+        g.authenticated_username = username
         return f(*args, **kwargs)
     return decorated
 
@@ -1141,7 +1174,7 @@ def login():
         if not user_account:
             return jsonify({"status": "error", "message": "Account not found"}), 404
 
-        token = generate_session_token()
+        token = generate_session_token(user_profile['registration_number'])
         active_sessions[token] = user_profile['registration_number']
         create_notification(user_profile['id'], "Login successful", "Your account was accessed with K2 authentication.", "login")
 
