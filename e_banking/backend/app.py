@@ -127,11 +127,22 @@ def ensure_server_ecdh_keys():
     """Generate or load server long-term P-256 ECDH key pair."""
     global server_ecdh_private_key_pem, server_ecdh_public_key_pem, server_ecdh_public_hex, server_ecdh_key_id
 
+    # Paper §2: prefer a Vault-isolated private key when configured (falls back to DB).
+    vault_pem = load_vault_secret(os.environ.get('SERVER_KEY_VAULT_SECRET', ''))
+    if vault_pem:
+        try:
+            server_ecdh_private_key_pem = vault_pem
+            server_ecdh_public_hex, server_ecdh_public_key_pem = derive_ecdh_publics(vault_pem)
+            print("[SERVER KEYS] Loaded ECDH P-256 key from Supabase Vault", flush=True)
+            return
+        except Exception as e:
+            print(f"[VAULT] ECDH key unusable, falling back to DB: {e}", flush=True)
+
     # Try loading from DB2 first
     try:
         result = business_db.table('server_keys').select('*').eq('id', server_ecdh_key_id).execute()
         if result.data and len(result.data) > 0:
-            server_ecdh_private_key_pem = result.data[0]['private_key_pem']
+            server_ecdh_private_key_pem = unwrap_server_secret(result.data[0]['private_key_pem'])
             server_ecdh_public_key_pem = result.data[0]['public_key_pem']
             # Derive hex format
             priv_obj = HybridEnvelopeCrypto.load_server_ecdh_private_key(server_ecdh_private_key_pem)
@@ -154,7 +165,7 @@ def ensure_server_ecdh_keys():
     try:
         business_db.table('server_keys').insert({
             'id': server_ecdh_key_id,
-            'private_key_pem': server_ecdh_private_key_pem,
+            'private_key_pem': wrap_server_secret(server_ecdh_private_key_pem),
             'public_key_pem': server_ecdh_public_key_pem,
         }).execute()
         print(f"[SERVER KEYS] Saved ECDH P-256 keys to database (KeyID={server_ecdh_key_id})", flush=True)
@@ -173,7 +184,7 @@ def ensure_server_rsa_keys():
     try:
         result = business_db.table('server_keys').select('*').eq('id', 'server').execute()
         if result.data and len(result.data) > 0:
-            server_private_key_pem = result.data[0]['private_key_pem']
+            server_private_key_pem = unwrap_server_secret(result.data[0]['private_key_pem'])
             server_public_key_pem = result.data[0]['public_key_pem']
             print("[SERVER KEYS] Loaded RSA keys from database", flush=True)
             return
@@ -189,7 +200,7 @@ def ensure_server_rsa_keys():
     try:
         business_db.table('server_keys').insert({
             'id': 'server',
-            'private_key_pem': server_private_key_pem,
+            'private_key_pem': wrap_server_secret(server_private_key_pem),
             'public_key_pem': server_public_key_pem,
         }).execute()
         print("[SERVER KEYS] Saved RSA keys to database", flush=True)
@@ -363,6 +374,14 @@ def auto_create_tables():
                         event_type TEXT NOT NULL,
                         details TEXT,
                         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    );
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS used_nonces (
+                        nonce TEXT PRIMARY KEY,
+                        txid TEXT,
+                        sender TEXT,
+                        used_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                     );
                 """)
                 cur.close()
@@ -894,6 +913,109 @@ def log_security_event(username, event_type, details):
 
 
 # ========================================
+# Nonce replay state (paper §3 step 3)
+# ========================================
+
+def is_nonce_used(nonce):
+    if not nonce:
+        return False
+    try:
+        r = business_db.table('used_nonces').select('nonce').eq('nonce', nonce).execute()
+        return bool(r.data)
+    except Exception:
+        return False
+
+
+def mark_nonce_used(nonce, txid=None, sender=None):
+    if not nonce:
+        return
+    try:
+        business_db.table('used_nonces').insert({'nonce': nonce, 'txid': txid, 'sender': sender}).execute()
+    except Exception as e:
+        if not is_missing_schema_error(e):
+            print(f"[NONCE] mark failed: {e}", flush=True)
+
+
+# ========================================
+# Server key protection at rest (HSM-equivalent isolated secret, paper §2)
+# Set SERVER_KEY_WRAP_KEY (64-char hex) to encrypt the private-key PEMs at rest.
+# ========================================
+import base64 as _b64
+
+SERVER_KEY_WRAP_KEY = os.environ.get('SERVER_KEY_WRAP_KEY', '')
+
+
+def wrap_server_secret(plaintext):
+    """AES-256-GCM encrypt a private-key PEM with an env-held wrap key.
+    Returns 'enc:v1:<b64(iv|ct|tag)>'; falls back to plaintext when no wrap key."""
+    if not plaintext or len(SERVER_KEY_WRAP_KEY) < 64:
+        return plaintext
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        key = bytes.fromhex(SERVER_KEY_WRAP_KEY[:64])
+        iv = os.urandom(12)
+        ct = AESGCM(key).encrypt(iv, plaintext.encode(), b'server-key-v1')
+        return 'enc:v1:' + _b64.b64encode(iv + ct).decode()
+    except Exception as e:
+        print(f"[SERVER KEYS] wrap failed, storing plaintext: {e}", flush=True)
+        return plaintext
+
+
+def unwrap_server_secret(stored):
+    """Decrypt 'enc:v1:...' values; return plaintext unchanged otherwise."""
+    if not stored or not str(stored).startswith('enc:v1:'):
+        return stored
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        key = bytes.fromhex(SERVER_KEY_WRAP_KEY[:64])
+        raw = _b64.b64decode(str(stored)[len('enc:v1:'):])
+        iv, ct = raw[:12], raw[12:]
+        return AESGCM(key).decrypt(iv, ct, b'server-key-v1').decode()
+    except Exception as e:
+        print(f"[SERVER KEYS] unwrap failed: {e}", flush=True)
+        raise
+
+
+# ========================================
+# Supabase Vault hook (paper §2: "HSM or equivalent isolated service")
+# Set SERVER_KEY_VAULT_SECRET to the vault secret name holding the ECDH private
+# key PEM. If absent/unavailable the DB row is used (graceful fallback).
+# ========================================
+
+def load_vault_secret(name):
+    """Read a secret via the SECURITY DEFINER RPC 'vault_read_secret' (if deployed)."""
+    if not name:
+        return None
+    try:
+        res = business_db.rpc('vault_read_secret', {'secret_name': name}).execute()
+        data = res.data
+        if isinstance(data, list) and data:
+            row = data[0]
+            return row.get('secret') if isinstance(row, dict) else row
+        if isinstance(data, str):
+            return data
+    except Exception as e:
+        print(f"[VAULT] read '{name}' unavailable, using DB key: {str(e)[:120]}", flush=True)
+    return None
+
+
+def derive_ecdh_publics(private_pem):
+    """Given a P-256 private PEM, return (uncompressed_hex, public_pem)."""
+    from cryptography.hazmat.primitives import serialization
+    priv_obj = HybridEnvelopeCrypto.load_server_ecdh_private_key(private_pem)
+    pub = priv_obj.public_key()
+    pub_hex = pub.public_bytes(
+        encoding=serialization.Encoding.X962,
+        format=serialization.PublicFormat.UncompressedPoint,
+    ).hex()
+    pub_pem = pub.public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    ).decode()
+    return pub_hex, pub_pem
+
+
+# ========================================
 # API Endpoints
 # ========================================
 
@@ -972,6 +1094,9 @@ def get_server_public_key():
         "alg": key_record.get("alg") or "ECDH-P256+HKDF-SHA256+AES-256-GCM+ECDSA-P256",
         "version": key_record.get("version") or 1,
         "revoked_at": key_record.get("revoked_at"),
+        # Paper §4.1 emergency revocation: clients must re-synchronize online
+        # before constructing further envelopes.
+        "force_online_resync": bool(key_record.get("revoked_at")),
     }), 200
 
 
@@ -1142,6 +1267,9 @@ def process_transfer():
                 if not fresh_ok:
                     log_security_event(username, 'stale_envelope', {"txid": txid, "reason": fresh_reason})
                     return jsonify({"status": "error", "message": fresh_reason}), 400
+                if is_nonce_used(AAD.get('N')):
+                    log_security_event(username, 'nonce_replay', {"txid": txid})
+                    return jsonify({"status": "error", "message": "Envelope nonce has already been used"}), 409
 
                 # Step 4: Idempotency short-circuit (authoritative atomic reserve at step 8)
                 cached_result = check_idempotency(txid)
@@ -1219,6 +1347,7 @@ def process_transfer():
                 }
                 # Commit the transaction identity immediately after the atomic move.
                 commit_idempotency(txid, result)
+                mark_nonce_used(AAD.get('N'), txid, username)
 
                 # Best-effort side effects (must never fail an already-settled transfer).
                 try:
@@ -1533,6 +1662,9 @@ def claim_transfer():
         if not fresh_ok:
             log_security_event(receiver_claimant, 'stale_envelope', {"txid": txid, "reason": fresh_reason})
             return jsonify({"status": "error", "message": fresh_reason}), 400
+        if is_nonce_used(AAD.get('N')):
+            log_security_event(receiver_claimant, 'nonce_replay', {"txid": txid})
+            return jsonify({"status": "error", "message": "Envelope nonce has already been used"}), 409
 
         cached_result = check_idempotency(txid)
         if cached_result:
@@ -1615,6 +1747,7 @@ def claim_transfer():
             "txid": txid
         }
         commit_idempotency(txid, result)
+        mark_nonce_used(AAD.get('N'), txid, sender_username)
 
         # Best-effort side effects (must never fail an already-settled transfer).
         try:
