@@ -270,6 +270,9 @@ def auto_create_tables():
                         daily_limit REAL NOT NULL DEFAULT 5000.0,
                         today_spent REAL NOT NULL DEFAULT 0.0,
                         rsa_public_key TEXT,
+                        ecdsa_public_key_duress TEXT,
+                        duress_limit REAL NOT NULL DEFAULT 500.0,
+                        duress_today_spent REAL NOT NULL DEFAULT 0.0,
                         full_name_enc TEXT,
                         mobile_enc TEXT,
                         mobile_hmac TEXT,
@@ -285,6 +288,10 @@ def auto_create_tables():
                         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                     );
                 """)
+                # HTE duress profile columns (paper §3.1).
+                cur.execute("ALTER TABLE profiles ADD COLUMN IF NOT EXISTS ecdsa_public_key_duress TEXT;")
+                cur.execute("ALTER TABLE profiles ADD COLUMN IF NOT EXISTS duress_limit REAL NOT NULL DEFAULT 500.0;")
+                cur.execute("ALTER TABLE profiles ADD COLUMN IF NOT EXISTS duress_today_spent REAL NOT NULL DEFAULT 0.0;")
                 cur.close()
                 print("[DB1 SETUP] profiles table created/verified", flush=True)
             except Exception as e:
@@ -384,9 +391,11 @@ def auto_create_tables():
                         nonce TEXT PRIMARY KEY,
                         txid TEXT,
                         sender TEXT,
-                        used_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                        used_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        expires_at TIMESTAMPTZ
                     );
                 """)
+                cur.execute("ALTER TABLE used_nonces ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;")
                 cur.close()
                 print("[DB2 SETUP] All tables created/verified", flush=True)
             except Exception as e:
@@ -650,6 +659,18 @@ def update_daily_spend(profile_id, today_spent):
         print(f"Error updating daily spend: {e}")
         return False
 
+def add_duress_spend(profile_id, amount):
+    """Accumulate the duress-profile spend counter against L_D (paper §3.1/§4.1)."""
+    try:
+        db = identity_db if identity_db else business_db
+        row = db.table('profiles').select('duress_today_spent').eq('id', profile_id).execute()
+        cur = float(row.data[0].get('duress_today_spent', 0) or 0) if row.data else 0.0
+        db.table('profiles').update({'duress_today_spent': cur + float(amount)}).eq('id', profile_id).execute()
+    except Exception as e:
+        if is_missing_schema_error(e):
+            raise
+        print(f"[DURESS] spend update failed: {e}", flush=True)
+
 def same_username(left, right):
     """Compare usernames after normalizing user-entered casing and spacing."""
     return str(left or "").strip().casefold() == str(right or "").strip().casefold()
@@ -692,6 +713,8 @@ def save_idempotency(txid, profile_id, receiver_account_id, amount, status, resu
 
 HTE_MAX_CLOCK_SKEW_SECONDS = int(os.environ.get('HTE_MAX_CLOCK_SKEW_SECONDS', '300'))
 KEY_ROTATION_GRACE_SECONDS = int(os.environ.get('KEY_ROTATION_GRACE_SECONDS', '86400'))
+# Nonce replay-state lifetime (paper §3 step 3 / §4.1). Env-tunable.
+NONCE_TTL_SECONDS = int(os.environ.get('NONCE_TTL_SECONDS', '86400'))
 
 
 def parse_envelope_timestamp(t_value):
@@ -868,12 +891,13 @@ def release_idempotency(txid):
         print(f"Error releasing idempotency key: {e}")
 
 
-def update_accounts_atomic(sender_account_id, receiver_account_id, amount):
-    """Atomic conditional debit + credit (paper §3 step 8).
+def update_accounts_atomic(sender_account_id, receiver_account_id, amount, nonce=None, txid=None, sender=None):
+    """Atomic conditional debit + credit + (optional) nonce burn (paper §3 step 8).
 
     Returns (ok, sender_new_balance, receiver_new_balance, reason).
-    Uses a real Postgres transaction with a conditional debit when a direct DB
-    connection is available; otherwise falls back to best-effort sequential updates.
+    Runs the debit, the credit and the nonce insert inside a SINGLE Postgres
+    transaction (autocommit disabled for this connection). Falls back to
+    best-effort sequential updates only when no direct DB connection exists.
     """
     amount = float(amount)
     db2_password = os.environ.get('SUPABASE_DB_PASSWORD', '')
@@ -883,6 +907,9 @@ def update_accounts_atomic(sender_account_id, receiver_account_id, amount):
 
     if conn:
         try:
+            # Force a real transaction — get_db_connection() ships with autocommit=True
+            # (used for DDL); without this the debit and credit commit separately.
+            conn.autocommit = False
             cur = conn.cursor()
             cur.execute(
                 "UPDATE accounts SET balance = balance - %s "
@@ -901,6 +928,15 @@ def update_accounts_atomic(sender_account_id, receiver_account_id, amount):
             )
             row2 = cur.fetchone()
             receiver_new_balance = float(row2[0]) if row2 else None
+
+            # Burn the nonce inside the same transaction (paper §3 step 3 / §4.1).
+            if nonce:
+                cur.execute(
+                    "INSERT INTO used_nonces (nonce, txid, sender, expires_at) "
+                    "VALUES (%s, %s, %s, now() + make_interval(secs => %s)) "
+                    "ON CONFLICT (nonce) DO NOTHING",
+                    (nonce, txid, sender, NONCE_TTL_SECONDS),
+                )
 
             conn.commit()
             return True, sender_new_balance, receiver_new_balance, None
@@ -950,11 +986,19 @@ def log_security_event(username, event_type, details):
 # ========================================
 
 def is_nonce_used(nonce):
+    """True if the nonce is stored AND not past its TTL (expired rows are reusable)."""
     if not nonce:
         return False
     try:
-        r = business_db.table('used_nonces').select('nonce').eq('nonce', nonce).execute()
-        return bool(r.data)
+        r = business_db.table('used_nonces').select('nonce,expires_at').eq('nonce', nonce).execute()
+        if not r.data:
+            return False
+        expires_at = r.data[0].get('expires_at')
+        if expires_at:
+            dt = parse_envelope_timestamp(expires_at)
+            if dt and dt < datetime.datetime.now(datetime.timezone.utc):
+                return False  # expired -> treat as unused
+        return True
     except Exception:
         return False
 
@@ -963,7 +1007,11 @@ def mark_nonce_used(nonce, txid=None, sender=None):
     if not nonce:
         return
     try:
-        business_db.table('used_nonces').insert({'nonce': nonce, 'txid': txid, 'sender': sender}).execute()
+        expires_at = (datetime.datetime.now(datetime.timezone.utc)
+                      + datetime.timedelta(seconds=NONCE_TTL_SECONDS)).isoformat()
+        business_db.table('used_nonces').insert({
+            'nonce': nonce, 'txid': txid, 'sender': sender, 'expires_at': expires_at,
+        }).execute()
     except Exception as e:
         if not is_missing_schema_error(e):
             print(f"[NONCE] mark failed: {e}", flush=True)
@@ -1270,9 +1318,11 @@ def process_transfer():
                     print(f"[TRANSFER] HTE key validity rejected for {username}: {key_reason}", flush=True)
                     return jsonify({"status": "error", "message": key_reason}), 403
 
-                # Step 2: Verify ECDSA signature using registered device public key
-                user_pub_key = user_profile.get('rsa_public_key') or user_profile.get('ecdsa_public_key')
-                if not user_pub_key:
+                # Step 2: Verify ECDSA signature against the registered key set
+                # {PK_normal, PK_duress}; record which key matched (paper §3.1).
+                normal_pub = user_profile.get('rsa_public_key') or user_profile.get('ecdsa_public_key')
+                duress_pub = user_profile.get('ecdsa_public_key_duress')
+                if not normal_pub and not duress_pub:
                     return jsonify({"status": "error", "message": "User has not enrolled device signing keys"}), 400
 
                 # Canonicalize AAD bytes (sorted JSON without whitespace)
@@ -1281,10 +1331,19 @@ def process_transfer():
                     str(v) + key_id
                 ).encode('utf-8') + bytes.fromhex(ePK) + bytes.fromhex(IV) + bytes.fromhex(C) + bytes.fromhex(Tag) + aad_bytes
 
-                if not HybridEnvelopeCrypto.verify_hte_signature(canonical_data, Sig, user_pub_key):
+                matched_duress = False
+                sig_ok = bool(normal_pub) and HybridEnvelopeCrypto.verify_hte_signature(canonical_data, Sig, normal_pub)
+                if not sig_ok and duress_pub:
+                    if HybridEnvelopeCrypto.verify_hte_signature(canonical_data, Sig, duress_pub):
+                        sig_ok = True
+                        matched_duress = True
+                if not sig_ok:
                     print(f"[TRANSFER] HTE ECDSA signature verification failed for user {username}", flush=True)
                     log_security_event(username, 'signature_rejected', {"txid": txid})
                     return jsonify({"status": "error", "message": "Biometric device signature verification failed"}), 403
+                if matched_duress:
+                    # Silent duress risk event (paper §3.1) — no client-visible warning.
+                    log_security_event(username, 'duress_used', {"txid": txid, "key": "duress"})
 
                 # Step 3: Verify freshness policy, nonce syntax and TxID format
                 tx_time_str = AAD.get('T')
@@ -1338,6 +1397,14 @@ def process_transfer():
                     log_security_event(username, 'daily_limit_exceeded', {"txid": txid, "amount": amount, "today_spent": today_spent, "daily_limit": daily_limit})
                     return jsonify({"status": "futile", "message": "Daily limit exceeded"}), 400
 
+                # Duress profile (paper §3.1): restricted spend limit L_D.
+                if matched_duress:
+                    ld = float(user_profile.get('duress_limit', 500) or 500)
+                    duress_spent = float(user_profile.get('duress_today_spent', 0) or 0)
+                    if amount > ld or duress_spent + amount > ld:
+                        log_security_event(username, 'duress_limit_exceeded', {"txid": txid, "amount": amount, "duress_spent": duress_spent, "duress_limit": ld})
+                        return jsonify({"status": "futile", "message": "Duress spend limit exceeded"}), 400
+
                 receiver_account = get_receiver_account(receiver_username)
                 if not receiver_account:
                     txn = record_transaction(user_account['id'], None, amount, 'aborted', 'Receiver not found')
@@ -1358,7 +1425,8 @@ def process_transfer():
                     return jsonify({"status": "error", "message": "Transaction is already being processed"}), 409
 
                 ok, sender_new_balance, receiver_new_balance, settle_reason = update_accounts_atomic(
-                    user_account['id'], receiver_account['id'], amount
+                    user_account['id'], receiver_account['id'], amount,
+                    nonce=AAD.get('N'), txid=txid, sender=username,
                 )
                 if not ok:
                     release_idempotency(txid)
@@ -1381,6 +1449,8 @@ def process_transfer():
                 # Commit the transaction identity immediately after the atomic move.
                 commit_idempotency(txid, result)
                 mark_nonce_used(AAD.get('N'), txid, username)
+                if matched_duress:
+                    add_duress_spend(user_profile['id'], amount)
 
                 # Best-effort side effects (must never fail an already-settled transfer).
                 try:
@@ -1707,15 +1777,24 @@ def claim_transfer():
         sender_profile = get_user_profile(sender_username)
         if not sender_profile:
             return jsonify({"status": "error", "message": "Sender not found"}), 404
-        sender_pub_key = sender_profile.get('rsa_public_key') or sender_profile.get('ecdsa_public_key')
-        if not sender_pub_key:
+        normal_pub = sender_profile.get('rsa_public_key') or sender_profile.get('ecdsa_public_key')
+        duress_pub = sender_profile.get('ecdsa_public_key_duress')
+        if not normal_pub and not duress_pub:
             return jsonify({"status": "error", "message": "Sender has not enrolled device signing keys"}), 400
 
         aad_bytes = json.dumps(AAD, sort_keys=True, separators=(',', ':')).encode('utf-8')
         canonical_data = (str(v) + key_id).encode('utf-8') + bytes.fromhex(ePK) + bytes.fromhex(IV) + bytes.fromhex(C) + bytes.fromhex(Tag) + aad_bytes
-        if not HybridEnvelopeCrypto.verify_hte_signature(canonical_data, Sig, sender_pub_key):
+        matched_duress = False
+        sig_ok = bool(normal_pub) and HybridEnvelopeCrypto.verify_hte_signature(canonical_data, Sig, normal_pub)
+        if not sig_ok and duress_pub:
+            if HybridEnvelopeCrypto.verify_hte_signature(canonical_data, Sig, duress_pub):
+                sig_ok = True
+                matched_duress = True
+        if not sig_ok:
             log_security_event(receiver_claimant, 'claim_signature_rejected', {"txid": txid, "sender": sender_username})
             return jsonify({"status": "error", "message": "Sender device signature verification failed"}), 403
+        if matched_duress:
+            log_security_event(sender_username, 'duress_used', {"txid": txid, "key": "duress"})
 
         # Derive KT and decrypt to confirm amount / receiver / TxID.
         server_priv_key = HybridEnvelopeCrypto.load_server_ecdh_private_key(server_ecdh_private_key_pem)
@@ -1754,6 +1833,15 @@ def claim_transfer():
             log_security_event(sender_username, 'daily_limit_exceeded', {"txid": txid, "amount": amount})
             return jsonify({"status": "futile", "message": "Daily limit exceeded"}), 400
 
+        # Duress profile (paper §3.1): offline-queued duress envelopes are re-checked here,
+        # so a client that locally exhausted L_D is still rejected authoritatively.
+        if matched_duress:
+            ld = float(sender_profile.get('duress_limit', 500) or 500)
+            duress_spent = float(sender_profile.get('duress_today_spent', 0) or 0)
+            if amount > ld or duress_spent + amount > ld:
+                log_security_event(sender_username, 'duress_limit_exceeded', {"txid": txid, "amount": amount, "duress_spent": duress_spent, "duress_limit": ld})
+                return jsonify({"status": "futile", "message": "Duress spend limit exceeded"}), 400
+
         reserve_state, reserved_cached = reserve_idempotency(txid, sender_profile['id'], receiver_account['id'], amount)
         if reserve_state == 'committed':
             return jsonify(reserved_cached or {"status": "success", "message": "Transaction already settled"}), 200
@@ -1761,7 +1849,8 @@ def claim_transfer():
             return jsonify({"status": "error", "message": "Transaction is already being processed"}), 409
 
         ok, sender_new_balance, receiver_new_balance, settle_reason = update_accounts_atomic(
-            sender_account['id'], receiver_account['id'], amount
+            sender_account['id'], receiver_account['id'], amount,
+            nonce=AAD.get('N'), txid=txid, sender=sender_username,
         )
         if not ok:
             release_idempotency(txid)
@@ -1781,6 +1870,8 @@ def claim_transfer():
         }
         commit_idempotency(txid, result)
         mark_nonce_used(AAD.get('N'), txid, sender_username)
+        if matched_duress:
+            add_duress_spend(sender_profile['id'], amount)
 
         # Best-effort side effects (must never fail an already-settled transfer).
         try:
@@ -2015,6 +2106,7 @@ def register():
         mobile = data.get('mobile') or data.get('phone') or ''
         email = data.get('email') or ''
         rsa_public_key = data.get('rsaPublicKey') or data.get('rsa_public_key') or data.get('ecdsaPublicKey') or data.get('ecdsa_public_key') or ''
+        ecdsa_public_key_duress = data.get('ecdsaPublicKeyDuress') or data.get('ecdsa_public_key_duress') or ''
         biometric_enrolled = data.get('biometricEnrolled', False)
 
         # Check if user already exists (DB1)
@@ -2072,6 +2164,8 @@ def register():
         # Add new fields if available
         if rsa_public_key:
             profile_data['rsa_public_key'] = rsa_public_key
+        if ecdsa_public_key_duress:
+            profile_data['ecdsa_public_key_duress'] = ecdsa_public_key_duress
         if full_name_enc:
             profile_data['full_name_enc'] = full_name_enc
         if mobile_enc:
