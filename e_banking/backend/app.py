@@ -1224,7 +1224,15 @@ def login():
 
         token = generate_session_token(user_profile['registration_number'])
         active_sessions[token] = user_profile['registration_number']
-        create_notification(user_profile['id'], "Login successful", "Your account was accessed with K2 authentication.", "login")
+
+        # A "verify-only" call (the app re-checks the PIN before every transaction) must
+        # NOT spam a "Login successful" notification on each verification.
+        verify_only = (
+            request.headers.get('X-DPT-Verify-Only', '').strip().lower() in ('1', 'true', 'yes')
+            or bool(data.get('verifyOnly'))
+        )
+        if not verify_only:
+            create_notification(user_profile['id'], "Login successful", "Your account was accessed with K2 authentication.", "login")
 
         # Decrypt full name if available
         full_name = ''
