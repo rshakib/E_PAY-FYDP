@@ -80,7 +80,7 @@ create table if not exists public.profiles (
   email text,
   rsa_public_key text,
   ecdsa_public_key_duress text,
-  duress_limit numeric(14, 2) not null default 500.00,
+  duress_limit numeric(14, 2) not null default 250.00,
   duress_today_spent numeric(14, 2) not null default 0.00,
   status public.account_status not null default 'active',
   created_at timestamptz not null default now(),
@@ -91,7 +91,7 @@ create table if not exists public.profiles (
 -- HTE duress columns for pre-existing profiles tables (paper §3.1).
 alter table public.profiles add column if not exists rsa_public_key text;
 alter table public.profiles add column if not exists ecdsa_public_key_duress text;
-alter table public.profiles add column if not exists duress_limit numeric(14, 2) not null default 500.00;
+alter table public.profiles add column if not exists duress_limit numeric(14, 2) not null default 250.00;
 alter table public.profiles add column if not exists duress_today_spent numeric(14, 2) not null default 0.00;
 
 create table if not exists public.accounts (

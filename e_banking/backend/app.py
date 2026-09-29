@@ -271,7 +271,7 @@ def auto_create_tables():
                         today_spent REAL NOT NULL DEFAULT 0.0,
                         rsa_public_key TEXT,
                         ecdsa_public_key_duress TEXT,
-                        duress_limit REAL NOT NULL DEFAULT 500.0,
+                        duress_limit REAL NOT NULL DEFAULT 250.0,
                         duress_today_spent REAL NOT NULL DEFAULT 0.0,
                         full_name_enc TEXT,
                         mobile_enc TEXT,
@@ -290,7 +290,7 @@ def auto_create_tables():
                 """)
                 # HTE duress profile columns (paper §3.1).
                 cur.execute("ALTER TABLE profiles ADD COLUMN IF NOT EXISTS ecdsa_public_key_duress TEXT;")
-                cur.execute("ALTER TABLE profiles ADD COLUMN IF NOT EXISTS duress_limit REAL NOT NULL DEFAULT 500.0;")
+                cur.execute("ALTER TABLE profiles ADD COLUMN IF NOT EXISTS duress_limit REAL NOT NULL DEFAULT 250.0;")
                 cur.execute("ALTER TABLE profiles ADD COLUMN IF NOT EXISTS duress_today_spent REAL NOT NULL DEFAULT 0.0;")
                 cur.close()
                 print("[DB1 SETUP] profiles table created/verified", flush=True)
@@ -1399,7 +1399,7 @@ def process_transfer():
 
                 # Duress profile (paper §3.1): restricted spend limit L_D.
                 if matched_duress:
-                    ld = float(user_profile.get('duress_limit', 500) or 500)
+                    ld = float(user_profile.get('duress_limit', 250) or 250)
                     duress_spent = float(user_profile.get('duress_today_spent', 0) or 0)
                     if amount > ld or duress_spent + amount > ld:
                         log_security_event(username, 'duress_limit_exceeded', {"txid": txid, "amount": amount, "duress_spent": duress_spent, "duress_limit": ld})
@@ -1836,7 +1836,7 @@ def claim_transfer():
         # Duress profile (paper §3.1): offline-queued duress envelopes are re-checked here,
         # so a client that locally exhausted L_D is still rejected authoritatively.
         if matched_duress:
-            ld = float(sender_profile.get('duress_limit', 500) or 500)
+            ld = float(sender_profile.get('duress_limit', 250) or 250)
             duress_spent = float(sender_profile.get('duress_today_spent', 0) or 0)
             if amount > ld or duress_spent + amount > ld:
                 log_security_event(sender_username, 'duress_limit_exceeded', {"txid": txid, "amount": amount, "duress_spent": duress_spent, "duress_limit": ld})
