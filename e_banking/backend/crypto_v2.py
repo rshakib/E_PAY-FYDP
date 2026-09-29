@@ -84,22 +84,30 @@ class HybridEnvelopeCrypto:
             return ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), pub_bytes)
 
     @staticmethod
-    def derive_hte_session_key(server_private_key, ephemeral_pub_hex: str, aad: dict, key_id: str) -> bytes:
+    def derive_hte_session_key(server_private_key, ephemeral_pub_hex: str, aad: dict, key_id: str, shared_z: bytes = None) -> bytes:
         """Derive transaction-specific AES-256 key KT according to paper equations (2)-(6):
         Z = ECDH(SK_B^dh, ePK)
         salt = H(HTE-v1-salt || S || TxID || N)
         info = HTE-v1/AES-256-GCM || T || ePK || KeyID
         KT = HKDF-Expand(HKDF-Extract(salt, Z), info, 32)
+
+        `shared_z` is the Mode B (HSM) path: when the receiver's ECDH private key
+        lives inside AWS KMS, Z is computed by KMS and passed in here, so this
+        process never needs the private key. When omitted, Z is computed locally
+        from `server_private_key` (Vault/DB software key).
         """
         from cryptography.hazmat.primitives.asymmetric import ec
         from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
         # Ephemeral public key
         eph_pub_bytes = bytes.fromhex(ephemeral_pub_hex)
-        eph_pub_key = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), eph_pub_bytes)
 
-        # 1. Z = ECDH(SK_B^dh, ePK)
-        shared_z = server_private_key.exchange(ec.ECDH(), eph_pub_key)
+        # 1. Z = ECDH(SK_B^dh, ePK)  — from the HSM when supplied, else locally.
+        if shared_z is None:
+            if server_private_key is None:
+                raise ValueError("derive_hte_session_key requires server_private_key or shared_z")
+            eph_pub_key = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), eph_pub_bytes)
+            shared_z = server_private_key.exchange(ec.ECDH(), eph_pub_key)
 
         # 2. salt = SHA256(HTE-v1-salt || S || TxID || N)
         salt_data = ('HTE-v1-salt' + str(aad.get('S', '')) + str(aad.get('TxID', '')) + str(aad.get('N', ''))).encode('utf-8')

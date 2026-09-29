@@ -6,6 +6,10 @@ import base64
 from flask_cors import CORS
 from crypto import CryptoEngine
 from crypto_v2 import HybridEnvelopeCrypto, PIIEncryption, LookupHash
+try:
+    import kms_bridge
+except Exception:
+    kms_bridge = None
 import datetime
 import re
 import threading
@@ -130,6 +134,24 @@ def ensure_server_ecdh_keys():
     """Generate or load server long-term P-256 ECDH key pair."""
     global server_ecdh_private_key_pem, server_ecdh_public_key_pem, server_ecdh_public_hex, server_ecdh_key_id
 
+    # Paper §2 (Mode B / HSM): when AWS KMS is configured the receiver's ECDH
+    # private key lives in the HSM and never enters this process. We only fetch
+    # the public half here; the shared secret is derived inside KMS per transfer.
+    if kms_bridge is not None and kms_bridge.kms_enabled():
+        try:
+            server_ecdh_public_hex, server_ecdh_public_key_pem = kms_bridge.get_public_key()
+            server_ecdh_private_key_pem = None
+            server_ecdh_key_id = kms_bridge.kms_key_id()
+            meta = {}
+            try:
+                meta = kms_bridge.describe_key()
+            except Exception:
+                pass
+            print(f"[SERVER KEYS] Using AWS KMS HSM key (KeyID={server_ecdh_key_id}, spec={meta.get('spec')}, state={meta.get('state')})", flush=True)
+            return
+        except Exception as e:
+            print(f"[KMS] Could not load HSM public key, falling back to software key: {e}", flush=True)
+
     # Paper §2: prefer a Vault-isolated private key when configured (falls back to DB).
     vault_pem = load_vault_secret(os.environ.get('SERVER_KEY_VAULT_SECRET', ''))
     if vault_pem:
@@ -177,6 +199,24 @@ def ensure_server_ecdh_keys():
             print("[SERVER KEYS] DB tables not ready yet, ECDH keys held in memory only", flush=True)
         else:
             print(f"[SERVER KEYS] Could not save ECDH keys to DB: {e}", flush=True)
+
+
+def derive_kt_server_side(ephemeral_pub_hex, aad, key_id):
+    """Paper §3 step (5): derive the transaction key KT.
+
+    When AWS KMS is configured the receiver's ECDH private key stays inside the
+    HSM and Z = ECDH(SK_R^dh, ePK) is computed by KMS (Mode B); otherwise Z is
+    computed here from the Vault/DB software key. Both paths yield an identical Z,
+    so the rest of the protocol (HKDF, AES-GCM) is unchanged.
+    """
+    if kms_bridge is not None and kms_bridge.kms_enabled():
+        try:
+            z = kms_bridge.derive_shared_secret_z(ephemeral_pub_hex)
+            return HybridEnvelopeCrypto.derive_hte_session_key(None, ephemeral_pub_hex, aad, key_id, shared_z=z)
+        except Exception as e:
+            print(f"[KMS] DeriveSharedSecret failed, using software key: {e}", flush=True)
+    server_priv_key = HybridEnvelopeCrypto.load_server_ecdh_private_key(server_ecdh_private_key_pem)
+    return HybridEnvelopeCrypto.derive_hte_session_key(server_priv_key, ephemeral_pub_hex, aad, key_id)
 
 
 def ensure_server_rsa_keys():
@@ -1378,8 +1418,8 @@ def process_transfer():
                     return jsonify(cached_result), 200
 
                 # Step 5: Derive transaction key KT via ECDH(SK_B^dh, ePK) + HKDF-SHA256
-                server_priv_key = HybridEnvelopeCrypto.load_server_ecdh_private_key(server_ecdh_private_key_pem)
-                KT = HybridEnvelopeCrypto.derive_hte_session_key(server_priv_key, ePK, AAD, key_id)
+                # (Z comes from the HSM when AWS KMS is configured — paper §2).
+                KT = derive_kt_server_side(ePK, AAD, key_id)
 
                 # Step 6: Verify GCM tag and decrypt payment payload M
                 payload = HybridEnvelopeCrypto.decrypt_hte_payload(C, IV, Tag, aad_bytes, KT)
@@ -1805,8 +1845,8 @@ def claim_transfer():
             log_security_event(sender_username, 'duress_used', {"txid": txid, "key": "duress"})
 
         # Derive KT and decrypt to confirm amount / receiver / TxID.
-        server_priv_key = HybridEnvelopeCrypto.load_server_ecdh_private_key(server_ecdh_private_key_pem)
-        KT = HybridEnvelopeCrypto.derive_hte_session_key(server_priv_key, ePK, AAD, key_id)
+        # (Z comes from the HSM when AWS KMS is configured — paper §2.)
+        KT = derive_kt_server_side(ePK, AAD, key_id)
         payload = HybridEnvelopeCrypto.decrypt_hte_payload(C, IV, Tag, aad_bytes, KT)
 
         # The receiver identifier lives inside the encrypted payload M (not in AAD).
