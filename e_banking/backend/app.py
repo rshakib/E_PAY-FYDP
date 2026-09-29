@@ -108,9 +108,6 @@ else:
 # ============================================
 pii_encryption = None
 lookup_hash = None
-server_private_key_pem = None
-server_public_key_pem = None
-server_private_key_pem = None
 
 server_ecdh_private_key_pem = None
 server_ecdh_public_key_pem = None
@@ -217,41 +214,6 @@ def derive_kt_server_side(ephemeral_pub_hex, aad, key_id):
             print(f"[KMS] DeriveSharedSecret failed, using software key: {e}", flush=True)
     server_priv_key = HybridEnvelopeCrypto.load_server_ecdh_private_key(server_ecdh_private_key_pem)
     return HybridEnvelopeCrypto.derive_hte_session_key(server_priv_key, ephemeral_pub_hex, aad, key_id)
-
-
-def ensure_server_rsa_keys():
-    """Generate or load server RSA key pair (legacy fallback)."""
-    global server_private_key_pem, server_public_key_pem
-
-    # Try loading from DB2 first
-    try:
-        result = business_db.table('server_keys').select('*').eq('id', 'server').execute()
-        if result.data and len(result.data) > 0:
-            server_private_key_pem = unwrap_server_secret(result.data[0]['private_key_pem'])
-            server_public_key_pem = result.data[0]['public_key_pem']
-            print("[SERVER KEYS] Loaded RSA keys from database", flush=True)
-            return
-    except Exception as e:
-        if not is_missing_schema_error(e):
-            print(f"[SERVER KEYS] Could not load from DB: {e}", flush=True)
-
-    # Generate new key pair
-    server_private_key_pem, server_public_key_pem = HybridEnvelopeCrypto.generate_server_rsa_keypair()
-    print("[SERVER KEYS] Generated new RSA-2048 key pair", flush=True)
-
-    # Try to save to DB2
-    try:
-        business_db.table('server_keys').insert({
-            'id': 'server',
-            'private_key_pem': wrap_server_secret(server_private_key_pem),
-            'public_key_pem': server_public_key_pem,
-        }).execute()
-        print("[SERVER KEYS] Saved RSA keys to database", flush=True)
-    except Exception as e:
-        if is_missing_schema_error(e):
-            print("[SERVER KEYS] DB tables not ready yet, keys held in memory only", flush=True)
-        else:
-            print(f"[SERVER KEYS] Could not save to DB: {e}", flush=True)
 
 
 # ============================================
@@ -729,23 +691,6 @@ def check_idempotency(txid):
             raise
         return None
 
-def save_idempotency(txid, profile_id, receiver_account_id, amount, status, result_dict):
-    """Save idempotency key to DB2."""
-    try:
-        business_db.table('idempotency_keys').insert({
-            'key': txid,
-            'profile_id': str(profile_id),
-            'receiver_account_id': str(receiver_account_id) if receiver_account_id else None,
-            'amount': float(amount),
-            'status': status,
-            'result_json': json.dumps(result_dict),
-        }).execute()
-    except Exception as e:
-        if is_missing_schema_error(e):
-            raise
-        print(f"Error saving idempotency key: {e}")
-
-
 # ========================================
 # HTE Protocol Helpers (key validity, freshness, atomic settlement)
 # Implements paper §3 (receiver checks) + §4.1 (revocation-aware deferred submission).
@@ -1197,18 +1142,17 @@ start_self_ping()
 @app.route('/server-public-key', methods=['GET'])
 def get_server_public_key():
     """Return the server's ECDH P-256 public key (hex and PEM) and KeyID for Hybrid Transaction Envelopes."""
-    if not server_ecdh_public_hex and not server_public_key_pem:
+    if not server_ecdh_public_hex:
         return jsonify({"status": "error", "message": "Server cryptographic keys not initialized"}), 500
 
     key_record = get_server_key_record(server_ecdh_key_id) or {}
     return jsonify({
         "status": "success",
-        "public_key": server_ecdh_public_hex or server_public_key_pem,
+        "public_key": server_ecdh_public_hex,
         "ecdh_public_key": server_ecdh_public_hex,
         "ecdh_public_pem": server_ecdh_public_key_pem,
         "key_id": server_ecdh_key_id,
         "KeyID": server_ecdh_key_id,
-        "rsa_public_key": server_public_key_pem,
         # Paper §4.1: key-validity metadata for client-side caching.
         "valid_from": key_record.get("valid_from"),
         "valid_until": key_record.get("valid_until"),
@@ -1517,98 +1461,6 @@ def process_transfer():
             except Exception as hte_err:
                 print(f"[TRANSFER] HTE processing error: {hte_err}", flush=True)
                 return jsonify({"status": "error", "message": f"HTE envelope error: {str(hte_err)}"}), 400
-
-        # ============================================
-        # PATH 1B: Legacy RSA Envelope
-        # ============================================
-        elif envelope and envelope.get('encrypted_key') and server_private_key_pem:
-            try:
-                txid = envelope.get('txid', '')
-
-                # 1. Idempotency check
-                cached_result = check_idempotency(txid)
-                if cached_result:
-                    print(f"[TRANSFER] Idempotent duplicate TxID: {txid}", flush=True)
-                    return jsonify(cached_result), 200
-
-                # 2. Decrypt session key with server RSA private key
-                session_key = HybridEnvelopeCrypto.decrypt_session_key(
-                    envelope['encrypted_key'], server_private_key_pem
-                )
-
-                # 3. Decrypt payload M = {S, R, A, T, N, TxID}
-                payload = HybridEnvelopeCrypto.decrypt_payload(
-                    envelope['ciphertext'], envelope['nonce'], session_key
-                )
-
-                # 4. Verify RSA-PSS signature
-                user_pub_key = user_profile.get('rsa_public_key')
-                if not user_pub_key:
-                    return jsonify({"status": "error", "message": "User has not enrolled RSA keys. Use legacy transfer."}), 400
-
-                sign_message = json.dumps({
-                    "ciphertext": envelope['ciphertext'],
-                    "nonce": envelope['nonce'],
-                    "encrypted_key": envelope['encrypted_key'],
-                    "txid": txid,
-                }, sort_keys=True).encode()
-
-                if not HybridEnvelopeCrypto.verify_signature(sign_message, envelope['signature'], user_pub_key):
-                    return jsonify({"status": "error", "message": "Signature verification failed"}), 403
-
-                # Business validation & settlement
-                receiver_username = validate_username(payload.get('R'))
-                amount = float(payload.get('A', 0))
-                txid_from_payload = payload.get('TxID', '')
-
-                if txid != txid_from_payload:
-                    return jsonify({"status": "error", "message": "TxID mismatch between envelope and payload"}), 400
-                if not receiver_username:
-                    return jsonify({"status": "error", "message": "Invalid receiver username"}), 400
-                if amount <= 0:
-                    return jsonify({"status": "error", "message": "Amount must be greater than zero"}), 400
-                if same_username(username, receiver_username):
-                    return jsonify({"status": "error", "message": "Self transaction not allowed"}), 400
-
-                receiver_account = get_receiver_account(receiver_username)
-                if not receiver_account:
-                    txn = record_transaction(user_account['id'], None, amount, 'aborted', 'Receiver not found')
-                    create_notification(user_profile['id'], "Transfer aborted", "Receiver username was not found.", "transfer_aborted", txn.get('id') if txn else None)
-                    return jsonify({"status": "error", "message": "Receiver not found"}), 404
-
-                if user_account['balance'] < amount:
-                    txn = record_transaction(user_account['id'], receiver_account['id'], amount, 'futile', 'Insufficient balance')
-                    create_notification(user_profile['id'], "Transfer futile", "Insufficient balance.", "transfer_futile", txn.get('id') if txn else None)
-                    return jsonify({"status": "futile", "message": "Insufficient balance"}), 400
-
-                sender_new_balance = float(user_account['balance']) - amount
-                receiver_new_balance = float(receiver_account['balance']) + amount
-
-                update_account_balance(user_account['id'], sender_new_balance)
-                update_account_balance(receiver_account['id'], receiver_new_balance)
-
-                new_t = datetime.datetime.now(datetime.timezone.utc).isoformat()
-                update_profile_timestamp(user_profile['id'], new_t)
-                update_daily_spend(user_profile['id'], float(user_profile.get('today_spent', 0)) + amount)
-
-                txn = record_transaction(user_account['id'], receiver_account['id'], amount, 'success')
-                transaction_id = txn.get('id') if txn else None
-                create_notification(user_profile['id'], "Transfer successful", f"BDT {amount:.2f} sent to {receiver_username}.", "transfer_success", transaction_id)
-                create_notification(receiver_account['profile_id'], "Money received", f"BDT {amount:.2f} received from {username}.", "transfer_success", transaction_id)
-
-                result = {
-                    "status": "success",
-                    "message": f"Transfer of {amount} to {receiver_username} successful",
-                    "new_t": new_t,
-                    "new_balance": sender_new_balance
-                }
-
-                save_idempotency(txid, user_profile['id'], receiver_account['id'], amount, 'committed', result)
-                return jsonify(result), 200
-
-            except Exception as envelope_err:
-                print(f"[TRANSFER] RSA envelope processing error: {envelope_err}", flush=True)
-                return jsonify({"status": "error", "message": f"Envelope processing failed: {str(envelope_err)}"}), 400
 
         # ============================================
         # PATH 2: Legacy plaintext / old encrypted
@@ -2409,7 +2261,6 @@ with app.app_context():
 
     auto_create_tables()
     ensure_server_ecdh_keys()
-    ensure_server_rsa_keys()
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', '5001'))
