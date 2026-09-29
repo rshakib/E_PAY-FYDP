@@ -318,6 +318,49 @@ create policy beneficiaries_self_read on public.beneficiaries
 for select to authenticated
 using (owner_profile_id = auth.uid());
 
+-- ============================================================
+-- HTE protocol tables (paper §3 / §4.1)
+-- Also auto-created at backend startup by auto_create_tables().
+-- ============================================================
+
+-- Long-term receiver (bank) ECDH key with validity + revocation metadata.
+create table if not exists public.server_keys (
+    id text primary key default 'server',
+    private_key_pem text not null,
+    public_key_pem text not null,
+    created_at timestamptz not null default now(),
+    valid_from timestamptz,
+    valid_until timestamptz,
+    alg text,
+    version integer,
+    revoked_at timestamptz
+);
+alter table public.server_keys add column if not exists valid_from timestamptz;
+alter table public.server_keys add column if not exists valid_until timestamptz;
+alter table public.server_keys add column if not exists alg text;
+alter table public.server_keys add column if not exists version integer;
+alter table public.server_keys add column if not exists revoked_at timestamptz;
+
+-- Atomic idempotency / replay protection bound to the unique TxID.
+create table if not exists public.idempotency_keys (
+    key text primary key,
+    profile_id text not null,
+    receiver_account_id text,
+    amount real not null,
+    status text not null default 'pending',
+    result_json text,
+    created_at timestamptz not null default now()
+);
+
+-- Silent risk events (signature/key failures, stale envelopes, revocation, limits).
+create table if not exists public.security_events (
+    id uuid primary key default gen_random_uuid(),
+    username text,
+    event_type text not null,
+    details text,
+    created_at timestamptz not null default now()
+);
+
 notify pgrst, 'reload schema';
 
 

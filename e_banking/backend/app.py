@@ -338,6 +338,30 @@ def auto_create_tables():
                         id TEXT PRIMARY KEY DEFAULT 'server',
                         private_key_pem TEXT NOT NULL,
                         public_key_pem TEXT NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        valid_from TIMESTAMPTZ,
+                        valid_until TIMESTAMPTZ,
+                        alg TEXT,
+                        version INTEGER,
+                        revoked_at TIMESTAMPTZ
+                    );
+                """)
+                # Migrations for existing databases (paper §4.1 key validity/revocation).
+                for column in (
+                    "valid_from TIMESTAMPTZ",
+                    "valid_until TIMESTAMPTZ",
+                    "alg TEXT",
+                    "version INTEGER",
+                    "revoked_at TIMESTAMPTZ",
+                ):
+                    cur.execute(f"ALTER TABLE server_keys ADD COLUMN IF NOT EXISTS {column};")
+
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS security_events (
+                        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                        username TEXT,
+                        event_type TEXT NOT NULL,
+                        details TEXT,
                         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                     );
                 """)
@@ -610,6 +634,266 @@ def save_idempotency(txid, profile_id, receiver_account_id, amount, status, resu
 
 
 # ========================================
+# HTE Protocol Helpers (key validity, freshness, atomic settlement)
+# Implements paper §3 (receiver checks) + §4.1 (revocation-aware deferred submission).
+# ========================================
+
+HTE_MAX_CLOCK_SKEW_SECONDS = int(os.environ.get('HTE_MAX_CLOCK_SKEW_SECONDS', '300'))
+KEY_ROTATION_GRACE_SECONDS = int(os.environ.get('KEY_ROTATION_GRACE_SECONDS', '86400'))
+
+
+def parse_envelope_timestamp(t_value):
+    """Envelope timestamp T may be ISO-8601, or epoch seconds/milliseconds."""
+    if t_value is None:
+        return None
+    if isinstance(t_value, (int, float)) and not isinstance(t_value, bool):
+        secs = float(t_value)
+        if secs > 1e12:  # milliseconds
+            secs = secs / 1000.0
+        try:
+            return datetime.datetime.fromtimestamp(secs, tz=datetime.timezone.utc)
+        except Exception:
+            return None
+    try:
+        text = str(t_value).strip().replace('Z', '+00:00')
+        dt = datetime.datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
+def is_txid_valid(txid):
+    """TxID format policy (paper §3 step 3): bounded, opaque token."""
+    if not isinstance(txid, str):
+        return False
+    txid = txid.strip()
+    return 8 <= len(txid) <= 128 and re.fullmatch(r"[A-Za-z0-9._:\-]+", txid) is not None
+
+
+def is_nonce_valid(nonce):
+    """Nonce syntax policy (paper §3 step 3)."""
+    if not isinstance(nonce, str):
+        return False
+    return 4 <= len(nonce.strip()) <= 128
+
+
+def check_freshness(t_value):
+    """Verify timestamp policy. Returns (ok, reason)."""
+    dt = parse_envelope_timestamp(t_value)
+    if dt is None:
+        return False, "Invalid or missing timestamp T"
+    now = datetime.datetime.now(datetime.timezone.utc)
+    skew = abs((now - dt).total_seconds())
+    if skew > HTE_MAX_CLOCK_SKEW_SECONDS:
+        return False, f"Stale or future-dated envelope (skew {int(skew)}s > {HTE_MAX_CLOCK_SKEW_SECONDS}s)"
+    return True, None
+
+
+def get_server_key_record(key_id):
+    """Load a server key record (validity/revocation metadata) from DB2 if present."""
+    try:
+        result = business_db.table('server_keys').select('*').eq('id', key_id).execute()
+        if result.data and len(result.data) > 0:
+            return result.data[0]
+    except Exception as e:
+        if not is_missing_schema_error(e):
+            print(f"[SERVER KEYS] Could not load key record {key_id}: {e}", flush=True)
+    return None
+
+
+def validate_key_at_creation(key_id, t_value):
+    """Revocation-aware key-validity check against the envelope *creation* time T.
+
+    Paper §4.1: if T >= T_rev the envelope is rejected (signature created after
+    revocation cannot be trusted); if T < T_rev a bounded grace window applies.
+    Returns (ok, reason).
+    """
+    if key_id == server_ecdh_key_id:
+        active = True
+    else:
+        active = False
+
+    record = get_server_key_record(key_id)
+    creation = parse_envelope_timestamp(t_value)
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    if record:
+        revoked_at = parse_envelope_timestamp(record.get('revoked_at')) if record.get('revoked_at') else None
+        valid_from = parse_envelope_timestamp(record.get('valid_from')) if record.get('valid_from') else None
+        valid_until = parse_envelope_timestamp(record.get('valid_until')) if record.get('valid_until') else None
+
+        if creation is None:
+            return False, "Invalid envelope timestamp T"
+
+        if valid_from and creation < valid_from:
+            return False, "Envelope predates the key validity window"
+
+        if revoked_at and creation >= revoked_at:
+            return False, "Key was revoked before this envelope was created"
+
+        if revoked_at and creation < revoked_at:
+            # Signed before revocation -> bounded grace policy.
+            grace_end = revoked_at + datetime.timedelta(seconds=KEY_ROTATION_GRACE_SECONDS)
+            if now > grace_end:
+                return False, "Key revocation grace period elapsed"
+            return True, None
+
+        if valid_until and creation > valid_until:
+            grace_end = valid_until + datetime.timedelta(seconds=KEY_ROTATION_GRACE_SECONDS)
+            if now > grace_end:
+                return False, "Key validity window elapsed (beyond grace)"
+        return True, None
+
+    # No metadata row: only the current active key is accepted.
+    if not active:
+        return False, f"Unknown or retired KeyID: {key_id}"
+    return True, None
+
+
+def reserve_idempotency(txid, profile_id, receiver_account_id, amount):
+    """Atomically reserve a TxID BEFORE any balance mutation.
+
+    Returns (state, cached_result) with state in {'new','committed','inflight'}.
+    Insert-first on the PRIMARY KEY removes the check-then-save race so two
+    concurrent identical envelopes cannot both settle.
+    """
+    try:
+        existing = business_db.table('idempotency_keys').select('*').eq('key', txid).execute()
+        if existing.data:
+            entry = existing.data[0]
+            if entry.get('status') == 'committed':
+                try:
+                    return 'committed', json.loads(entry['result_json'])
+                except Exception:
+                    return 'committed', None
+            return 'inflight', None
+
+        business_db.table('idempotency_keys').insert({
+            'key': txid,
+            'profile_id': str(profile_id),
+            'receiver_account_id': str(receiver_account_id) if receiver_account_id else None,
+            'amount': float(amount),
+            'status': 'pending',
+            'result_json': None,
+        }).execute()
+        return 'new', None
+    except Exception as e:
+        if is_missing_schema_error(e):
+            raise
+        # Likely a unique-PK violation from a concurrent request.
+        try:
+            again = business_db.table('idempotency_keys').select('*').eq('key', txid).execute()
+            if again.data and again.data[0].get('status') == 'committed':
+                try:
+                    return 'committed', json.loads(again.data[0]['result_json'])
+                except Exception:
+                    return 'committed', None
+        except Exception:
+            pass
+        return 'inflight', None
+
+
+def commit_idempotency(txid, result_dict):
+    """Mark a reserved TxID as committed and store the canonical result."""
+    try:
+        business_db.table('idempotency_keys').update({
+            'status': 'committed',
+            'result_json': json.dumps(result_dict),
+        }).eq('key', txid).execute()
+    except Exception as e:
+        if is_missing_schema_error(e):
+            raise
+        print(f"Error committing idempotency key: {e}")
+
+
+def release_idempotency(txid):
+    """Drop a reservation for a transfer that did not settle (allows retry)."""
+    try:
+        business_db.table('idempotency_keys').delete().eq('key', txid).execute()
+    except Exception as e:
+        print(f"Error releasing idempotency key: {e}")
+
+
+def update_accounts_atomic(sender_account_id, receiver_account_id, amount):
+    """Atomic conditional debit + credit (paper §3 step 8).
+
+    Returns (ok, sender_new_balance, receiver_new_balance, reason).
+    Uses a real Postgres transaction with a conditional debit when a direct DB
+    connection is available; otherwise falls back to best-effort sequential updates.
+    """
+    amount = float(amount)
+    db2_password = os.environ.get('SUPABASE_DB_PASSWORD', '')
+    conn = None
+    if db2_password and not db2_password.startswith('YOUR_') and not SANDBOX_FAKE_DB:
+        conn = get_db_connection(SUPABASE_URL, db2_password)
+
+    if conn:
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE accounts SET balance = balance - %s "
+                "WHERE id = %s::uuid AND balance >= %s RETURNING balance",
+                (amount, sender_account_id, amount),
+            )
+            row = cur.fetchone()
+            if not row:
+                conn.rollback()
+                return False, None, None, "Insufficient balance"
+            sender_new_balance = float(row[0])
+
+            cur.execute(
+                "UPDATE accounts SET balance = balance + %s WHERE id = %s::uuid RETURNING balance",
+                (amount, receiver_account_id),
+            )
+            row2 = cur.fetchone()
+            receiver_new_balance = float(row2[0]) if row2 else None
+
+            conn.commit()
+            return True, sender_new_balance, receiver_new_balance, None
+        except Exception as e:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            print(f"[TRANSFER] Atomic settlement failed: {e}", flush=True)
+            return False, None, None, f"Atomic settlement failed: {e}"
+        finally:
+            conn.close()
+
+    # Fallback: no direct DB connection (sandbox / no password) — best-effort.
+    sender_account = business_db.table('accounts').select('*').eq('id', sender_account_id).execute()
+    receiver_account = business_db.table('accounts').select('*').eq('id', receiver_account_id).execute()
+    if not sender_account.data or not receiver_account.data:
+        return False, None, None, "Account not found"
+    sender_balance = float(sender_account.data[0]['balance'])
+    receiver_balance = float(receiver_account.data[0]['balance'])
+    if sender_balance < amount:
+        return False, None, None, "Insufficient balance"
+    sender_new_balance = sender_balance - amount
+    receiver_new_balance = receiver_balance + amount
+    update_account_balance(sender_account_id, sender_new_balance)
+    update_account_balance(receiver_account_id, receiver_new_balance)
+    return True, sender_new_balance, receiver_new_balance, None
+
+
+def log_security_event(username, event_type, details):
+    """Persist a silent risk event for later review (paper §4.1 revocation/risk)."""
+    try:
+        business_db.table('security_events').insert({
+            'username': str(username) if username else None,
+            'event_type': str(event_type),
+            'details': details if isinstance(details, str) else json.dumps(details),
+        }).execute()
+    except Exception as e:
+        if is_missing_schema_error(e):
+            print(f"[SECURITY EVENT] (table missing) {event_type}: {details}", flush=True)
+            return
+        print(f"Error logging security event: {e}")
+
+
+# ========================================
 # API Endpoints
 # ========================================
 
@@ -673,6 +957,7 @@ def get_server_public_key():
     if not server_ecdh_public_hex and not server_public_key_pem:
         return jsonify({"status": "error", "message": "Server cryptographic keys not initialized"}), 500
 
+    key_record = get_server_key_record(server_ecdh_key_id) or {}
     return jsonify({
         "status": "success",
         "public_key": server_ecdh_public_hex or server_public_key_pem,
@@ -681,6 +966,12 @@ def get_server_public_key():
         "key_id": server_ecdh_key_id,
         "KeyID": server_ecdh_key_id,
         "rsa_public_key": server_public_key_pem,
+        # Paper §4.1: key-validity metadata for client-side caching.
+        "valid_from": key_record.get("valid_from"),
+        "valid_until": key_record.get("valid_until"),
+        "alg": key_record.get("alg") or "ECDH-P256+HKDF-SHA256+AES-256-GCM+ECDSA-P256",
+        "version": key_record.get("version") or 1,
+        "revoked_at": key_record.get("revoked_at"),
     }), 200
 
 
@@ -811,7 +1102,15 @@ def process_transfer():
                 if int(v) != 1:
                     return jsonify({"status": "error", "message": f"Unsupported HTE protocol version: {v}"}), 400
                 if key_id != server_ecdh_key_id:
+                    log_security_event(username, 'unknown_keyid', {"key_id": key_id, "txid": txid})
                     return jsonify({"status": "error", "message": f"Unknown or retired KeyID: {key_id}"}), 400
+
+                # Step 1b: Revocation-aware key validity vs the envelope creation time T
+                key_ok, key_reason = validate_key_at_creation(key_id, AAD.get('T'))
+                if not key_ok:
+                    log_security_event(username, 'key_validity_rejected', {"key_id": key_id, "reason": key_reason, "txid": txid})
+                    print(f"[TRANSFER] HTE key validity rejected for {username}: {key_reason}", flush=True)
+                    return jsonify({"status": "error", "message": key_reason}), 403
 
                 # Step 2: Verify ECDSA signature using registered device public key
                 user_pub_key = user_profile.get('rsa_public_key') or user_profile.get('ecdsa_public_key')
@@ -826,14 +1125,25 @@ def process_transfer():
 
                 if not HybridEnvelopeCrypto.verify_hte_signature(canonical_data, Sig, user_pub_key):
                     print(f"[TRANSFER] HTE ECDSA signature verification failed for user {username}", flush=True)
+                    log_security_event(username, 'signature_rejected', {"txid": txid})
                     return jsonify({"status": "error", "message": "Biometric device signature verification failed"}), 403
 
-                # Step 3: Verify timestamp freshness & TxID syntax
+                # Step 3: Verify freshness policy, nonce syntax and TxID format
                 tx_time_str = AAD.get('T')
                 if not tx_time_str or not txid:
                     return jsonify({"status": "error", "message": "Missing timestamp T or TxID in envelope AAD"}), 400
+                if not is_txid_valid(txid):
+                    log_security_event(username, 'invalid_txid', {"txid": txid})
+                    return jsonify({"status": "error", "message": "Invalid TxID format"}), 400
+                if not is_nonce_valid(AAD.get('N')):
+                    log_security_event(username, 'invalid_nonce', {"txid": txid})
+                    return jsonify({"status": "error", "message": "Invalid or missing nonce N"}), 400
+                fresh_ok, fresh_reason = check_freshness(tx_time_str)
+                if not fresh_ok:
+                    log_security_event(username, 'stale_envelope', {"txid": txid, "reason": fresh_reason})
+                    return jsonify({"status": "error", "message": fresh_reason}), 400
 
-                # Step 4: Idempotency check with unique TxID
+                # Step 4: Idempotency short-circuit (authoritative atomic reserve at step 8)
                 cached_result = check_idempotency(txid)
                 if cached_result:
                     print(f"[TRANSFER] Idempotent duplicate HTE TxID: {txid}", flush=True)
@@ -860,6 +1170,13 @@ def process_transfer():
                 if same_username(username, receiver_username):
                     return jsonify({"status": "error", "message": "Self transaction not allowed"}), 400
 
+                # Server-authoritative daily limit (paper §3 step 7)
+                daily_limit = float(user_profile.get('daily_limit', 5000) or 5000)
+                today_spent = float(user_profile.get('today_spent', 0) or 0)
+                if today_spent + amount > daily_limit:
+                    log_security_event(username, 'daily_limit_exceeded', {"txid": txid, "amount": amount, "today_spent": today_spent, "daily_limit": daily_limit})
+                    return jsonify({"status": "futile", "message": "Daily limit exceeded"}), 400
+
                 receiver_account = get_receiver_account(receiver_username)
                 if not receiver_account:
                     txn = record_transaction(user_account['id'], None, amount, 'aborted', 'Receiver not found')
@@ -871,22 +1188,28 @@ def process_transfer():
                     create_notification(user_profile['id'], "Transfer futile", "Insufficient balance.", "transfer_futile", txn.get('id') if txn else None)
                     return jsonify({"status": "futile", "message": "Insufficient balance"}), 400
 
-                # Step 8: Atomically commit financial update
-                sender_new_balance = float(user_account['balance']) - amount
-                receiver_new_balance = float(receiver_account['balance']) + amount
+                # Step 8: Atomic check-and-commit (reserve TxID, then move money atomically)
+                reserve_state, reserved_cached = reserve_idempotency(txid, user_profile['id'], receiver_account['id'], amount)
+                if reserve_state == 'committed':
+                    print(f"[TRANSFER] Concurrent duplicate HTE TxID settled already: {txid}", flush=True)
+                    return jsonify(reserved_cached or {"status": "success", "message": "Transaction already settled"}), 200
+                if reserve_state == 'inflight':
+                    return jsonify({"status": "error", "message": "Transaction is already being processed"}), 409
 
-                update_account_balance(user_account['id'], sender_new_balance)
-                update_account_balance(receiver_account['id'], receiver_new_balance)
+                ok, sender_new_balance, receiver_new_balance, settle_reason = update_accounts_atomic(
+                    user_account['id'], receiver_account['id'], amount
+                )
+                if not ok:
+                    release_idempotency(txid)
+                    if settle_reason == "Insufficient balance":
+                        txn = record_transaction(user_account['id'], receiver_account['id'], amount, 'futile', 'Insufficient balance')
+                        create_notification(user_profile['id'], "Transfer futile", "Insufficient balance.", "transfer_futile", txn.get('id') if txn else None)
+                        return jsonify({"status": "futile", "message": "Insufficient balance"}), 400
+                    print(f"[TRANSFER] HTE atomic settle failed for {username}: {settle_reason}", flush=True)
+                    log_security_event(username, 'settlement_failed', {"txid": txid, "reason": settle_reason})
+                    return jsonify({"status": "error", "message": settle_reason or "Settlement failed"}), 500
 
                 new_t = datetime.datetime.now(datetime.timezone.utc).isoformat()
-                update_profile_timestamp(user_profile['id'], new_t)
-                update_daily_spend(user_profile['id'], float(user_profile.get('today_spent', 0)) + amount)
-
-                txn = record_transaction(user_account['id'], receiver_account['id'], amount, 'success')
-                transaction_id = txn.get('id') if txn else None
-                create_notification(user_profile['id'], "Transfer successful", f"BDT {amount:.2f} sent to {receiver_username}.", "transfer_success", transaction_id)
-                create_notification(receiver_account['profile_id'], "Money received", f"BDT {amount:.2f} received from {username}.", "transfer_success", transaction_id)
-
                 result = {
                     "status": "success",
                     "message": f"Transfer of {amount} to {receiver_username} successful",
@@ -894,11 +1217,21 @@ def process_transfer():
                     "new_balance": sender_new_balance,
                     "txid": txid
                 }
+                # Commit the transaction identity immediately after the atomic move.
+                commit_idempotency(txid, result)
 
-                # Save atomic idempotency key
-                save_idempotency(txid, user_profile['id'], receiver_account['id'], amount, 'committed', result)
+                # Best-effort side effects (must never fail an already-settled transfer).
+                try:
+                    update_profile_timestamp(user_profile['id'], new_t)
+                    update_daily_spend(user_profile['id'], today_spent + amount)
+                    txn = record_transaction(user_account['id'], receiver_account['id'], amount, 'success')
+                    transaction_id = txn.get('id') if txn else None
+                    create_notification(user_profile['id'], "Transfer successful", f"BDT {amount:.2f} sent to {receiver_username}.", "transfer_success", transaction_id)
+                    create_notification(receiver_account['profile_id'], "Money received", f"BDT {amount:.2f} received from {username}.", "transfer_success", transaction_id)
+                except Exception as side_err:
+                    print(f"[TRANSFER] Post-settlement side-effect error (non-fatal): {side_err}", flush=True)
+
                 print(f"[TRANSFER] HTE transaction {txid} settled successfully!", flush=True)
-
                 return jsonify(result), 200
 
             except Exception as hte_err:
@@ -1046,6 +1379,23 @@ def process_transfer():
         else:
             return jsonify({"status": "error", "message": "Missing transfer payload or receiver/amount"}), 400
 
+        # Client-supplied idempotency key (same immutable identity on every retry).
+        idem_key = (
+            data.get('idempotencyKey')
+            or data.get('idempotency_key')
+            or request.headers.get('X-Idempotency-Key')
+            or request.headers.get('Idempotency-Key')
+            or ''
+        )
+        idem_key = str(idem_key).strip()
+        if idem_key and not is_txid_valid(idem_key):
+            idem_key = ''
+        if idem_key:
+            cached_result = check_idempotency(idem_key)
+            if cached_result:
+                print(f"[TRANSFER] Idempotent duplicate TxID: {idem_key}", flush=True)
+                return jsonify(cached_result), 200
+
         if not receiver_username:
             return jsonify({"status": "error", "message": "Invalid receiver username"}), 400
 
@@ -1065,34 +1415,62 @@ def process_transfer():
             create_notification(user_profile['id'], "Transfer aborted", "Receiver username was not found.", "transfer_aborted", txn.get('id') if txn else None)
             return jsonify({"status": "error", "message": "Receiver not found"}), 404
 
-        # Balance check
+        # Server-authoritative daily limit (paper §3 step 7)
+        daily_limit = float(user_profile.get('daily_limit', 5000) or 5000)
+        today_spent = float(user_profile.get('today_spent', 0) or 0)
+        if today_spent + amount > daily_limit:
+            log_security_event(username, 'daily_limit_exceeded', {"amount": amount, "today_spent": today_spent, "daily_limit": daily_limit})
+            return jsonify({"status": "futile", "message": "Daily limit exceeded"}), 400
+
+        # Balance pre-check for a friendly error (the atomic debit is the authority)
         if user_account['balance'] < amount:
             txn = record_transaction(user_account['id'], receiver_account['id'], amount, 'futile', 'Insufficient balance')
             create_notification(user_profile['id'], "Transfer futile", "Insufficient balance.", "transfer_futile", txn.get('id') if txn else None)
             return jsonify({"status": "futile", "message": "Insufficient balance"}), 400
 
-        # Execute transfer
-        sender_new_balance = float(user_account['balance']) - amount
-        receiver_new_balance = float(receiver_account['balance']) + amount
+        # Atomic check-and-commit
+        if idem_key:
+            reserve_state, reserved_cached = reserve_idempotency(idem_key, user_profile['id'], receiver_account['id'], amount)
+            if reserve_state == 'committed':
+                return jsonify(reserved_cached or {"status": "success", "message": "Transaction already settled"}), 200
+            if reserve_state == 'inflight':
+                return jsonify({"status": "error", "message": "Transaction is already being processed"}), 409
 
-        update_account_balance(user_account['id'], sender_new_balance)
-        update_account_balance(receiver_account['id'], receiver_new_balance)
+        ok, sender_new_balance, receiver_new_balance, settle_reason = update_accounts_atomic(
+            user_account['id'], receiver_account['id'], amount
+        )
+        if not ok:
+            if idem_key:
+                release_idempotency(idem_key)
+            if settle_reason == "Insufficient balance":
+                txn = record_transaction(user_account['id'], receiver_account['id'], amount, 'futile', 'Insufficient balance')
+                create_notification(user_profile['id'], "Transfer futile", "Insufficient balance.", "transfer_futile", txn.get('id') if txn else None)
+                return jsonify({"status": "futile", "message": "Insufficient balance"}), 400
+            log_security_event(username, 'settlement_failed', {"reason": settle_reason})
+            return jsonify({"status": "error", "message": settle_reason or "Settlement failed"}), 500
 
         new_t = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        update_profile_timestamp(user_profile['id'], new_t)
-        update_daily_spend(user_profile['id'], float(user_profile.get('today_spent', 0)) + amount)
-
-        txn = record_transaction(user_account['id'], receiver_account['id'], amount, 'success')
-        transaction_id = txn.get('id') if txn else None
-        create_notification(user_profile['id'], "Transfer successful", f"BDT {amount:.2f} sent to {receiver_username}.", "transfer_success", transaction_id)
-        create_notification(receiver_account['profile_id'], "Money received", f"BDT {amount:.2f} received from {username}.", "transfer_success", transaction_id)
-
-        return jsonify({
+        result = {
             "status": "success",
             "message": f"Transfer of {amount} to {receiver_username} successful",
             "new_t": new_t,
             "new_balance": sender_new_balance
-        }), 200
+        }
+        if idem_key:
+            commit_idempotency(idem_key, result)
+
+        # Best-effort side effects (must never fail an already-settled transfer).
+        try:
+            update_profile_timestamp(user_profile['id'], new_t)
+            update_daily_spend(user_profile['id'], today_spent + amount)
+            txn = record_transaction(user_account['id'], receiver_account['id'], amount, 'success')
+            transaction_id = txn.get('id') if txn else None
+            create_notification(user_profile['id'], "Transfer successful", f"BDT {amount:.2f} sent to {receiver_username}.", "transfer_success", transaction_id)
+            create_notification(receiver_account['profile_id'], "Money received", f"BDT {amount:.2f} received from {username}.", "transfer_success", transaction_id)
+        except Exception as side_err:
+            print(f"[TRANSFER] Post-settlement side-effect error (non-fatal): {side_err}", flush=True)
+
+        return jsonify(result), 200
 
     except Exception as e:
         if is_missing_schema_error(e):
@@ -1100,6 +1478,162 @@ def process_transfer():
             return missing_schema_response()
         print(f"Transfer error: {e}")
         return jsonify({"status": "error", "message": "Internal server error"}), 500
+
+
+@app.route('/transfer/claim', methods=['POST'])
+@require_auth
+def claim_transfer():
+    """Receiver-side claim of a sender-signed offline envelope (paper §4.1).
+
+    The sender builds and signs the envelope P offline; a copy is handed to the
+    receiver (QR / NFC) who submits the SAME immutable P here once online. The
+    server verifies the sender's ECDSA signature and settles atomically, so final
+    settlement stays receiver-authoritative — no ad-hoc crypto involved.
+    """
+    try:
+        data = get_json_body()
+        if data is None:
+            return jsonify({"status": "error", "message": "Invalid JSON request body"}), 400
+
+        envelope = data.get('envelope') or data
+        if not envelope or not (envelope.get('ePK') or envelope.get('epk')):
+            return jsonify({"status": "error", "message": "Missing HTE envelope"}), 400
+        if not server_ecdh_private_key_pem:
+            return jsonify({"status": "error", "message": "Server cryptographic keys not initialized"}), 500
+
+        ePK = envelope.get('ePK') or envelope.get('epk')
+        IV = envelope.get('IV') or envelope.get('iv')
+        C = envelope.get('C') or envelope.get('ciphertext')
+        Tag = envelope.get('Tag') or envelope.get('tag')
+        Sig = envelope.get('Sig') or envelope.get('sig') or envelope.get('signature')
+        AAD = envelope.get('AAD') or envelope.get('aad') or {}
+        v = envelope.get('v', 1)
+        key_id = envelope.get('KeyID') or envelope.get('key_id') or server_ecdh_key_id
+        txid = AAD.get('TxID') or envelope.get('txid') or ''
+
+        receiver_claimant = authenticated_username()
+        sender_username = validate_username(AAD.get('S'))
+        if not sender_username:
+            return jsonify({"status": "error", "message": "Envelope missing sender (S)"}), 400
+
+        if int(v) != 1:
+            return jsonify({"status": "error", "message": f"Unsupported HTE protocol version: {v}"}), 400
+        if key_id != server_ecdh_key_id:
+            log_security_event(receiver_claimant, 'unknown_keyid', {"key_id": key_id, "txid": txid})
+            return jsonify({"status": "error", "message": f"Unknown or retired KeyID: {key_id}"}), 400
+
+        key_ok, key_reason = validate_key_at_creation(key_id, AAD.get('T'))
+        if not key_ok:
+            log_security_event(receiver_claimant, 'key_validity_rejected', {"key_id": key_id, "reason": key_reason, "txid": txid})
+            return jsonify({"status": "error", "message": key_reason}), 403
+
+        if not is_txid_valid(txid) or not is_nonce_valid(AAD.get('N')):
+            return jsonify({"status": "error", "message": "Invalid TxID or nonce"}), 400
+        fresh_ok, fresh_reason = check_freshness(AAD.get('T'))
+        if not fresh_ok:
+            log_security_event(receiver_claimant, 'stale_envelope', {"txid": txid, "reason": fresh_reason})
+            return jsonify({"status": "error", "message": fresh_reason}), 400
+
+        cached_result = check_idempotency(txid)
+        if cached_result:
+            return jsonify(cached_result), 200
+
+        # Verify the SENDER's device signature.
+        sender_profile = get_user_profile(sender_username)
+        if not sender_profile:
+            return jsonify({"status": "error", "message": "Sender not found"}), 404
+        sender_pub_key = sender_profile.get('rsa_public_key') or sender_profile.get('ecdsa_public_key')
+        if not sender_pub_key:
+            return jsonify({"status": "error", "message": "Sender has not enrolled device signing keys"}), 400
+
+        aad_bytes = json.dumps(AAD, sort_keys=True, separators=(',', ':')).encode('utf-8')
+        canonical_data = (str(v) + key_id).encode('utf-8') + bytes.fromhex(ePK) + bytes.fromhex(IV) + bytes.fromhex(C) + bytes.fromhex(Tag) + aad_bytes
+        if not HybridEnvelopeCrypto.verify_hte_signature(canonical_data, Sig, sender_pub_key):
+            log_security_event(receiver_claimant, 'claim_signature_rejected', {"txid": txid, "sender": sender_username})
+            return jsonify({"status": "error", "message": "Sender device signature verification failed"}), 403
+
+        # Derive KT and decrypt to confirm amount / receiver / TxID.
+        server_priv_key = HybridEnvelopeCrypto.load_server_ecdh_private_key(server_ecdh_private_key_pem)
+        KT = HybridEnvelopeCrypto.derive_hte_session_key(server_priv_key, ePK, AAD, key_id)
+        payload = HybridEnvelopeCrypto.decrypt_hte_payload(C, IV, Tag, aad_bytes, KT)
+
+        # The receiver identifier lives inside the encrypted payload M (not in AAD).
+        payload_sender = validate_username(payload.get('S'))
+        payload_receiver = validate_username(payload.get('R'))
+        amount = float(payload.get('A', 0))
+        txid_from_payload = payload.get('TxID', '')
+
+        if not payload_receiver or not same_username(payload_sender, sender_username):
+            return jsonify({"status": "error", "message": "Envelope payload mismatch"}), 400
+        if txid != txid_from_payload:
+            return jsonify({"status": "error", "message": "TxID mismatch between envelope and payload"}), 400
+        if not same_username(receiver_claimant, payload_receiver):
+            log_security_event(receiver_claimant, 'claim_forbidden', {"txid": txid, "sender": sender_username, "receiver": payload_receiver})
+            return jsonify({"status": "error", "message": "Only the intended receiver can claim this envelope"}), 403
+        if amount <= 0:
+            return jsonify({"status": "error", "message": "Amount must be greater than zero"}), 400
+        if same_username(sender_username, payload_receiver):
+            return jsonify({"status": "error", "message": "Self transaction not allowed"}), 400
+
+        receiver_username = payload_receiver
+        receiver_profile = get_user_profile(receiver_username)
+        sender_account = get_user_account(sender_profile['id'])
+        receiver_account = get_user_account(receiver_profile['id']) if receiver_profile else None
+        if not sender_account or not receiver_account:
+            return jsonify({"status": "error", "message": "Sender or receiver account not found"}), 404
+
+        # Daily limit is debited against the SENDER (paper §3 step 7).
+        daily_limit = float(sender_profile.get('daily_limit', 5000) or 5000)
+        today_spent = float(sender_profile.get('today_spent', 0) or 0)
+        if today_spent + amount > daily_limit:
+            log_security_event(sender_username, 'daily_limit_exceeded', {"txid": txid, "amount": amount})
+            return jsonify({"status": "futile", "message": "Daily limit exceeded"}), 400
+
+        reserve_state, reserved_cached = reserve_idempotency(txid, sender_profile['id'], receiver_account['id'], amount)
+        if reserve_state == 'committed':
+            return jsonify(reserved_cached or {"status": "success", "message": "Transaction already settled"}), 200
+        if reserve_state == 'inflight':
+            return jsonify({"status": "error", "message": "Transaction is already being processed"}), 409
+
+        ok, sender_new_balance, receiver_new_balance, settle_reason = update_accounts_atomic(
+            sender_account['id'], receiver_account['id'], amount
+        )
+        if not ok:
+            release_idempotency(txid)
+            if settle_reason == "Insufficient balance":
+                return jsonify({"status": "futile", "message": "Insufficient balance"}), 400
+            log_security_event(sender_username, 'settlement_failed', {"txid": txid, "reason": settle_reason})
+            return jsonify({"status": "error", "message": settle_reason or "Settlement failed"}), 500
+
+        new_t = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        result = {
+            "status": "success",
+            "message": f"Claim of {amount} from {sender_username} settled",
+            "new_t": new_t,
+            "new_balance": sender_new_balance,
+            "receiver_balance": receiver_new_balance,
+            "txid": txid
+        }
+        commit_idempotency(txid, result)
+
+        # Best-effort side effects (must never fail an already-settled transfer).
+        try:
+            update_profile_timestamp(sender_profile['id'], new_t)
+            update_daily_spend(sender_profile['id'], today_spent + amount)
+            txn = record_transaction(sender_account['id'], receiver_account['id'], amount, 'success')
+            transaction_id = txn.get('id') if txn else None
+            create_notification(sender_profile['id'], "Transfer successful", f"BDT {amount:.2f} sent to {receiver_username}.", "transfer_success", transaction_id)
+            create_notification(receiver_account['profile_id'], "Money received", f"BDT {amount:.2f} received from {sender_username}.", "transfer_success", transaction_id)
+        except Exception as side_err:
+            print(f"[CLAIM] Post-settlement side-effect error (non-fatal): {side_err}", flush=True)
+
+        return jsonify(result), 200
+    except Exception as e:
+        if is_missing_schema_error(e):
+            return missing_schema_response()
+        print(f"Claim error: {e}")
+        return jsonify({"status": "error", "message": f"Claim failed: {str(e)}"}), 500
+
 
 @app.route('/user/<username>', methods=['GET'])
 @require_auth
@@ -1313,6 +1847,7 @@ def register():
         # New fields from enhanced registration
         full_name = data.get('fullName') or data.get('full_name') or ''
         mobile = data.get('mobile') or data.get('phone') or ''
+        email = data.get('email') or ''
         rsa_public_key = data.get('rsaPublicKey') or data.get('rsa_public_key') or data.get('ecdsaPublicKey') or data.get('ecdsa_public_key') or ''
         biometric_enrolled = data.get('biometricEnrolled', False)
 
