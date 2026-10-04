@@ -198,21 +198,51 @@ def ensure_server_ecdh_keys():
             print(f"[SERVER KEYS] Could not save ECDH keys to DB: {e}", flush=True)
 
 
-def derive_kt_server_side(ephemeral_pub_hex, aad, key_id):
-    """Paper §3 step (5): derive the transaction key KT.
+def is_known_key_id(key_id):
+    """True if this KeyID is the active receiver key or a retained server_keys row
+    (a retired key still inside its grace window)."""
+    if not key_id:
+        return False
+    if key_id == server_ecdh_key_id:
+        return True
+    try:
+        r = business_db.table('server_keys').select('id').eq('id', key_id).execute()
+        return bool(r.data)
+    except Exception:
+        return False
 
-    When AWS KMS is configured the receiver's ECDH private key stays inside the
-    HSM and Z = ECDH(SK_R^dh, ePK) is computed by KMS (Mode B); otherwise Z is
-    computed here from the Vault/DB software key. Both paths yield an identical Z,
-    so the rest of the protocol (HKDF, AES-GCM) is unchanged.
+
+def load_server_private_key_for(key_id):
+    """PEM of the receiver ECDH private key for a (possibly retired) KeyID, or None."""
+    if key_id == server_ecdh_key_id:
+        return server_ecdh_private_key_pem
+    try:
+        r = business_db.table('server_keys').select('private_key_pem').eq('id', key_id).execute()
+        if r.data and r.data[0].get('private_key_pem'):
+            return unwrap_server_secret(r.data[0]['private_key_pem'])
+    except Exception as e:
+        print(f"[SERVER KEYS] Could not load private key for KeyID={key_id}: {e}", flush=True)
+    return None
+
+
+def derive_kt_server_side(ephemeral_pub_hex, aad, key_id):
+    """Paper §3 step (5): derive the transaction key KT for the envelope's KeyID.
+
+    The active key uses the KMS HSM when configured (Mode B), otherwise its Vault/DB
+    software key. A retired-but-valid KeyID is served from the retained server_keys row
+    (epoch key rotation), so envelopes built just before a rotation still settle inside
+    the grace window.
     """
-    if kms_bridge is not None and kms_bridge.kms_enabled():
+    if key_id == server_ecdh_key_id and kms_bridge is not None and kms_bridge.kms_enabled():
         try:
             z = kms_bridge.derive_shared_secret_z(ephemeral_pub_hex)
             return HybridEnvelopeCrypto.derive_hte_session_key(None, ephemeral_pub_hex, aad, key_id, shared_z=z)
         except Exception as e:
             print(f"[KMS] DeriveSharedSecret failed, using software key: {e}", flush=True)
-    server_priv_key = HybridEnvelopeCrypto.load_server_ecdh_private_key(server_ecdh_private_key_pem)
+    priv_pem = load_server_private_key_for(key_id)
+    if not priv_pem:
+        raise ValueError(f"No receiver private key for KeyID={key_id}")
+    server_priv_key = HybridEnvelopeCrypto.load_server_ecdh_private_key(priv_pem)
     return HybridEnvelopeCrypto.derive_hte_session_key(server_priv_key, ephemeral_pub_hex, aad, key_id)
 
 
@@ -1302,7 +1332,7 @@ def process_transfer():
                 # Step 1: Validate protocol version and KeyID
                 if int(v) != 1:
                     return jsonify({"status": "error", "message": f"Unsupported HTE protocol version: {v}"}), 400
-                if key_id != server_ecdh_key_id:
+                if not is_known_key_id(key_id):
                     log_security_event(username, 'unknown_keyid', {"key_id": key_id, "txid": txid})
                     return jsonify({"status": "error", "message": f"Unknown or retired KeyID: {key_id}"}), 400
 
@@ -1660,7 +1690,7 @@ def claim_transfer():
 
         if int(v) != 1:
             return jsonify({"status": "error", "message": f"Unsupported HTE protocol version: {v}"}), 400
-        if key_id != server_ecdh_key_id:
+        if not is_known_key_id(key_id):
             log_security_event(receiver_claimant, 'unknown_keyid', {"key_id": key_id, "txid": txid})
             return jsonify({"status": "error", "message": f"Unknown or retired KeyID: {key_id}"}), 400
 
