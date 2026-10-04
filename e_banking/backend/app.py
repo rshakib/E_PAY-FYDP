@@ -697,6 +697,9 @@ def check_idempotency(txid):
 # ========================================
 
 HTE_MAX_CLOCK_SKEW_SECONDS = int(os.environ.get('HTE_MAX_CLOCK_SKEW_SECONDS', '300'))
+# Offline receipt QR lifetime (paper §IV offline handoff). The client shows a 60s
+# countdown; this bounds a screenshot/copy to the same window.
+CLAIM_MAX_AGE_SECONDS = int(os.environ.get('CLAIM_MAX_AGE_SECONDS', '60'))
 KEY_ROTATION_GRACE_SECONDS = int(os.environ.get('KEY_ROTATION_GRACE_SECONDS', '86400'))
 # Nonce replay-state lifetime (paper §3 step 3 / §4.1). Env-tunable.
 NONCE_TTL_SECONDS = int(os.environ.get('NONCE_TTL_SECONDS', '86400'))
@@ -1679,6 +1682,15 @@ def claim_transfer():
         if cached_result:
             return jsonify(cached_result), 200
 
+        # Offline receipt QR is short-lived: reject claims for envelopes older than
+        # CLAIM_MAX_AGE_SECONDS (default 60s). A committed TxID returned cached above.
+        _t_created = parse_envelope_timestamp(AAD.get('T'))
+        if _t_created is not None:
+            _claim_age = (datetime.datetime.now(datetime.timezone.utc) - _t_created).total_seconds()
+            if _claim_age > CLAIM_MAX_AGE_SECONDS:
+                log_security_event(receiver_claimant, 'claim_qr_expired', {"txid": txid, "age": int(_claim_age)})
+                return jsonify({"status": "error", "message": "Claim QR expired"}), 410
+
         if is_nonce_used(AAD.get('N')):
             log_security_event(receiver_claimant, 'nonce_replay', {"txid": txid})
             return jsonify({"status": "error", "message": "Envelope nonce has already been used"}), 409
@@ -1800,6 +1812,47 @@ def claim_transfer():
             return missing_schema_response()
         print(f"Claim error: {e}")
         return jsonify({"status": "error", "message": f"Claim failed: {str(e)}"}), 500
+
+
+@app.route('/device-key', methods=['POST'])
+@require_auth
+def register_device_key():
+    """Re-enroll the caller's device signing public key(s).
+
+    The device key is created once at registration. If it is later regenerated
+    (app reinstall, or a biometric-enrollment change invalidating the Keystore
+    key, or switching devices) the server-side copy goes stale and every HTE
+    transfer fails "Biometric device signature verification failed". This lets
+    the authenticated user re-sync the current device public key(s).
+    """
+    try:
+        username = authenticated_username()
+        if not username:
+            return jsonify({"status": "error", "message": "Unauthorized"}), 401
+        data = get_json_body() or {}
+        normal_pub = (data.get('normalPublicKey') or data.get('normal_public_key')
+                      or data.get('ecdsaPublicKey') or data.get('ecdsa_public_key') or '')
+        duress_pub = (data.get('duressPublicKey') or data.get('duress_public_key')
+                      or data.get('ecdsaPublicKeyDuress') or data.get('ecdsa_public_key_duress') or '')
+        profile = get_user_profile(username)
+        if not profile:
+            return jsonify({"status": "error", "message": "User not found"}), 404
+        update = {}
+        if normal_pub:
+            update['rsa_public_key'] = normal_pub
+        if duress_pub:
+            update['ecdsa_public_key_duress'] = duress_pub
+        if not update:
+            return jsonify({"status": "error", "message": "No public key supplied"}), 400
+        db = identity_db if identity_db else business_db
+        db.table('profiles').update(update).eq('registration_number', username).execute()
+        print(f"[DEVICE-KEY] Re-enrolled device key(s) for {username}", flush=True)
+        return jsonify({"status": "success", "message": "Device key enrolled"}), 200
+    except Exception as e:
+        if is_missing_schema_error(e):
+            return missing_schema_response()
+        print(f"Device-key error: {e}")
+        return jsonify({"status": "error", "message": f"Device key enrollment failed: {str(e)}"}), 500
 
 
 @app.route('/user/<username>', methods=['GET'])
