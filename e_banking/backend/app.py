@@ -1404,8 +1404,10 @@ def process_transfer():
 
                 receiver_account = get_receiver_account(receiver_username)
                 if not receiver_account:
-                    txn = record_transaction(user_account['id'], None, amount, 'aborted', 'Receiver not found')
-                    create_notification(user_profile['id'], "Transfer aborted", "Receiver username was not found.", "transfer_aborted", txn.get('id') if txn else None)
+                    # Not an executed transfer — do NOT write a history row (it would show
+                    # up as a phantom "Unknown" entry, once per retry). The result screen and
+                    # the notification below already inform the user.
+                    create_notification(user_profile['id'], "Transfer aborted", "Receiver username was not found.", "transfer_aborted", None)
                     return jsonify({"status": "error", "message": "Receiver not found"}), 404
 
                 if user_account['balance'] < amount:
@@ -1548,8 +1550,8 @@ def process_transfer():
         # Find receiver
         receiver_account = get_receiver_account(receiver_username)
         if not receiver_account:
-            txn = record_transaction(user_account['id'], None, amount, 'aborted', 'Receiver not found')
-            create_notification(user_profile['id'], "Transfer aborted", "Receiver username was not found.", "transfer_aborted", txn.get('id') if txn else None)
+            # Not an executed transfer — no history row (avoids phantom "Unknown" entries).
+            create_notification(user_profile['id'], "Transfer aborted", "Receiver username was not found.", "transfer_aborted", None)
             return jsonify({"status": "error", "message": "Receiver not found"}), 404
 
         # Server-authoritative daily limit (paper §3 step 7)
