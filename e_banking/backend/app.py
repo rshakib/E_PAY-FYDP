@@ -1351,15 +1351,20 @@ def process_transfer():
                 if not fresh_ok:
                     log_security_event(username, 'stale_envelope', {"txid": txid, "reason": fresh_reason})
                     return jsonify({"status": "error", "message": fresh_reason}), 400
-                if is_nonce_used(AAD.get('N')):
-                    log_security_event(username, 'nonce_replay', {"txid": txid})
-                    return jsonify({"status": "error", "message": "Envelope nonce has already been used"}), 409
-
-                # Step 4: Idempotency short-circuit (authoritative atomic reserve at step 8)
+                # Step 4: Idempotency short-circuit FIRST (authoritative atomic reserve at
+                # step 8). A committed TxID must return its stored result even though the
+                # envelope's nonce was already burned at settlement; otherwise a retry of an
+                # already-settled transfer would be misreported as a nonce replay (409), and
+                # the client would fail/refund it (duplicate success + failed row). A
+                # different TxID that reuses the same nonce is still rejected below.
                 cached_result = check_idempotency(txid)
                 if cached_result:
                     print(f"[TRANSFER] Idempotent duplicate HTE TxID: {txid}", flush=True)
                     return jsonify(cached_result), 200
+
+                if is_nonce_used(AAD.get('N')):
+                    log_security_event(username, 'nonce_replay', {"txid": txid})
+                    return jsonify({"status": "error", "message": "Envelope nonce has already been used"}), 409
 
                 # Step 5: Derive transaction key KT via ECDH(SK_B^dh, ePK) + HKDF-SHA256
                 # (Z comes from the HSM when AWS KMS is configured — paper §2).
@@ -1665,13 +1670,16 @@ def claim_transfer():
         if not fresh_ok:
             log_security_event(receiver_claimant, 'stale_envelope', {"txid": txid, "reason": fresh_reason})
             return jsonify({"status": "error", "message": fresh_reason}), 400
-        if is_nonce_used(AAD.get('N')):
-            log_security_event(receiver_claimant, 'nonce_replay', {"txid": txid})
-            return jsonify({"status": "error", "message": "Envelope nonce has already been used"}), 409
-
+        # Idempotency FIRST: a committed TxID returns its stored result even though its
+        # nonce was already burned at settlement (retry must not be misreported as a
+        # nonce replay). A different TxID reusing the nonce is still rejected below.
         cached_result = check_idempotency(txid)
         if cached_result:
             return jsonify(cached_result), 200
+
+        if is_nonce_used(AAD.get('N')):
+            log_security_event(receiver_claimant, 'nonce_replay', {"txid": txid})
+            return jsonify({"status": "error", "message": "Envelope nonce has already been used"}), 409
 
         # Verify the SENDER's device signature.
         sender_profile = get_user_profile(sender_username)
